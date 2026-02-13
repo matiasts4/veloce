@@ -1,0 +1,75 @@
+# Runtime files (preview/dev helpers)
+__v0_runtime_loader.js
+__v0_devtools.tsx
+__v0_jsx-dev-runtime.ts
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Node / Bun / Next
+node_modules/
+.next/
+out/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+bun.lockb
+
+# Tauri / Rust build outputs
+src-tauri/target/
+target/
+target_temp/
+build/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+ENV/
+python/__pycache__/
+
+# Audio and temp recordings
+*.wav
+*.mp3
+*.flac
+tmp/
+temp/
+
+# ML / model caches and large local assets
+.cache/
+models/
+checkpoints/
+weights/
+hf_cache/
+huggingface/
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# Keep lockfiles versioned for reproducible installs
+!bun.lock
+!package-lock.json
+!pnpm-lock.yaml
