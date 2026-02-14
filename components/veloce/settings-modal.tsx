@@ -242,6 +242,22 @@ export function SettingsModal({
     { id: "faster-whisper", label: "faster-whisper" },
     { id: "whispercpp", label: "whisper.cpp" },
   ];
+  const gpuStatusText = (() => {
+    if (activeBackend === "whispercpp") {
+      if (whispercppAvailable) {
+        return uiLanguage === "es"
+          ? "whisper.cpp activo (GPU según build Vulkan/CUDA)."
+          : "whisper.cpp active (GPU depends on Vulkan/CUDA build).";
+      }
+      return backendMap.get("whispercpp")?.reason || (uiLanguage === "es" ? "whisper.cpp no disponible" : "whisper.cpp unavailable");
+    }
+
+    if (gpuInfo.available) {
+      return gpuInfo.name || "GPU detected";
+    }
+
+    return gpuInfo.reason || "AMD / NVIDIA";
+  })();
   const getModelDownloadState = (modelId: string): ModelDownloadState =>
     modelDownloads[modelId] ?? { progress: 0, status: "idle" };
 
@@ -663,7 +679,7 @@ export function SettingsModal({
                 {t.gpuAcceleration}
               </Label>
               <span className="text-xs text-muted-foreground">
-                {gpuInfo.available ? (gpuInfo.name || "GPU detected") : (gpuInfo.reason || "AMD / NVIDIA")}
+                {gpuStatusText}
               </span>
             </div>
             <Switch

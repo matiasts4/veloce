@@ -1,40 +1,6 @@
-# Migración completa a Linux (Veloce)
+# Migración completa a Linux (Veloz Voice)
 
 Esta guía te deja el proyecto listo para desarrollo diario en Linux, evitando subir artefactos pesados a Git.
-
-## 0) Activar Linux en Windows (WSL2) para poder construir paquetes Linux
-
-Si estás en Windows y quieres generar paquetes Linux (`.deb` / `.AppImage`), primero habilita WSL2 con una distro Linux real.
-
-### Paso 1: instalar WSL + Ubuntu
-
-En PowerShell (Administrador):
-
-```powershell
-wsl --install -d Ubuntu-24.04
-```
-
-Reinicia si te lo pide.
-
-### Paso 2: verificar que la distro esté disponible
-
-```powershell
-wsl -l -v
-```
-
-Debe aparecer algo como `Ubuntu-24.04` en estado `Running` o `Stopped`.
-
-### Paso 3: entrar a Ubuntu
-
-```powershell
-wsl -d Ubuntu-24.04
-```
-
-Desde ahí ejecutas los pasos de esta guía.
-
-### Nota importante
-
-Si en `wsl -l -v` solo aparece `docker-desktop`, todavía no puedes construir el binario Linux de Veloce.
 
 ## 1) Objetivo
 
@@ -137,7 +103,7 @@ bun run tauri dev
 Si hay puertos/procesos colgados:
 
 ```bash
-pkill -f "next|bun|cargo|veloce" || true
+pkill -f "next|bun|cargo|veloz-voice" || true
 rm -f .next/dev/lock
 bun run tauri dev
 ```
@@ -150,25 +116,6 @@ cd src-tauri
 cargo check
 cd ..
 bun run tauri build
-```
-
-Salidas típicas Linux:
-
-- `src-tauri/target/release/bundle/deb/*.deb`
-- `src-tauri/target/release/bundle/appimage/*.AppImage`
-
-Para instalar en Ubuntu/Debian:
-
-```bash
-sudo dpkg -i src-tauri/target/release/bundle/deb/*.deb
-sudo apt -f install -y
-```
-
-Para probar AppImage:
-
-```bash
-chmod +x src-tauri/target/release/bundle/appimage/*.AppImage
-./src-tauri/target/release/bundle/appimage/*.AppImage
 ```
 
 ## 8) Configuración Git para evitar subir peso
@@ -209,18 +156,6 @@ export HF_HOME="$HOME/.cache/huggingface"
 Puedes ponerlo en `~/.bashrc` para persistir.
 
 ## 10) Troubleshooting rápido
-
-### ¿Cómo funciona `audio_engine` en Linux?
-
-- En Linux, Veloce usa `python/audio_engine.py` como sidecar de audio/transcripción.
-- No necesitas `audio-engine.exe` (ese binario es para empaquetado Windows).
-- Requisitos clave del engine Linux:
-  - `python3` + dependencias de `python/requirements.txt`
-  - `portaudio19-dev` / `libasound2-dev` para `sounddevice`
-
-Opcional avanzado en Linux:
-
-- Puedes empaquetar un binario Linux del engine con PyInstaller (`audio-engine` sin `.exe`), pero no es obligatorio para desarrollo normal.
 
 ### Error de `sounddevice` o PortAudio
 
@@ -269,12 +204,3 @@ git push
 - [ ] Corre app: `bun run tauri dev`
 - [ ] `.gitignore` bloquea artefactos pesados
 - [ ] `git status` muestra solo código/config/docs relevantes
-
-## 13) Verificación mínima para entregar a otro equipo Linux
-
-En el equipo Linux final, valida:
-
-1. La app abre (`.deb` o `.AppImage`).
-2. Se detecta micrófono en Configuración.
-3. Se puede descargar/seleccionar modelo.
-4. Se transcribe audio sin error de engine.

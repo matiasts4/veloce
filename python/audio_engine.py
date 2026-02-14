@@ -107,6 +107,46 @@ def normalize_backend_name(name: str) -> str:
     return normalized if normalized in SUPPORTED_BACKENDS else "auto"
 
 
+def get_torch_cuda_info() -> dict:
+    cuda_available = torch.cuda.is_available()
+    info = {
+        "cuda_available": cuda_available,
+        "torch_version": getattr(torch, "__version__", "unknown"),
+        "gpu_name": "None",
+        "vram_gb": None,
+    }
+
+    if not cuda_available:
+        return info
+
+    try:
+        info["gpu_name"] = torch.cuda.get_device_name(0)
+    except Exception:
+        info["gpu_name"] = "CUDA GPU"
+
+    try:
+        props = torch.cuda.get_device_properties(0)
+        info["vram_gb"] = round(float(props.total_memory) / (1024 ** 3), 2)
+    except Exception:
+        info["vram_gb"] = None
+
+    return info
+
+
+def choose_faster_whisper_runtime(prefer_gpu: bool) -> tuple[str, str, str]:
+    cuda_info = get_torch_cuda_info()
+    if prefer_gpu and cuda_info["cuda_available"]:
+        vram_gb = cuda_info.get("vram_gb")
+        if isinstance(vram_gb, (int, float)) and vram_gb < 7.5:
+            return "cuda", "int8_float16", "cuda_low_vram"
+        return "cuda", "float16", "cuda"
+
+    if prefer_gpu:
+        return "cpu", "int8", "no_cuda"
+
+    return "cpu", "int8", "gpu_disabled"
+
+
 def get_whispercpp_executable() -> Path | None:
     env_path = os.environ.get("WHISPERCPP_EXE")
     if env_path:
@@ -430,8 +470,11 @@ def get_whispercpp_status(model_name: str) -> dict:
 
 def resolve_backend(model_name: str, prefer_gpu: bool, backend_name: str) -> str:
     requested = normalize_backend_name(backend_name)
+    cuda_available = get_torch_cuda_info()["cuda_available"]
 
     if requested == "faster-whisper":
+        if prefer_gpu and not cuda_available:
+            emit({"log": "Backend faster-whisper seleccionado con GPU ON, pero CUDA no está disponible; se ejecutará en CPU."})
         return "faster-whisper"
 
     if requested == "whispercpp":
@@ -444,13 +487,14 @@ def resolve_backend(model_name: str, prefer_gpu: bool, backend_name: str) -> str
         return "faster-whisper"
 
     # auto
-    if prefer_gpu and not torch.cuda.is_available():
+    if prefer_gpu and not cuda_available:
         status = get_whispercpp_status(model_name)
         if status["available"]:
             emit({"log": "Auto backend: usando whisper.cpp para compatibilidad GPU en Windows/AMD."})
             if status.get("resolved_model") and status.get("resolved_model") != model_name:
                 emit({"log": f"Auto backend: modelo local usado por whisper.cpp: {status['resolved_model']}"})
             return "whispercpp"
+        emit({"log": f"Auto backend: CUDA no disponible y whisper.cpp no está listo ({status['reason']}). Se usará faster-whisper en CPU."})
 
     return "faster-whisper"
 
@@ -598,10 +642,17 @@ def get_hardware_info():
     except Exception as e:
         devices = [{"id": -1, "name": f"Error: {e}", "host_api": -1}]
     
-    gpu_available = torch.cuda.is_available()
-    gpu_name = torch.cuda.get_device_name(0) if gpu_available else "None"
+    cuda_info = get_torch_cuda_info()
+    gpu_available = bool(cuda_info["cuda_available"])
+    gpu_name = str(cuda_info["gpu_name"])
+    whispercpp_status = get_whispercpp_status(selected_model)
     gpu_reason = ""
-    if not gpu_available:
+    if active_backend == "whispercpp":
+        if whispercpp_status.get("available"):
+            gpu_reason = "Backend activo: whisper.cpp (aceleración según build Vulkan/CUDA)."
+        else:
+            gpu_reason = f"whisper.cpp no listo: {whispercpp_status.get('reason', '')}"
+    elif not gpu_available:
         torch_version = getattr(torch, "__version__", "unknown")
         if sys.platform.startswith("win") and "+cpu" in torch_version:
             gpu_reason = "PyTorch CPU-only detectado. faster-whisper/CTranslate2 no tiene GPU activa aquí; usa backend Auto/whisper.cpp para intentar aceleración GPU en Windows (si whisper.cpp está instalado con Vulkan)."
@@ -609,9 +660,14 @@ def get_hardware_info():
             gpu_reason = "CUDA no disponible para faster-whisper en este runtime. En Windows puedes usar backend whisper.cpp para GPUs AMD/NVIDIA (con build Vulkan)."
         else:
             gpu_reason = "No se detectó runtime GPU compatible para el backend actual."
+    else:
+        vram = cuda_info.get("vram_gb")
+        if isinstance(vram, (int, float)):
+            gpu_reason = f"CUDA disponible para faster-whisper ({vram} GB VRAM detectados)."
+        else:
+            gpu_reason = "CUDA disponible para faster-whisper."
     
     models = get_downloaded_models()
-    whispercpp_status = get_whispercpp_status(selected_model)
 
     # Always expose selectable models; downloaded models are marked in the name.
     fallback_models = [
@@ -673,11 +729,15 @@ def get_hardware_info():
 
 def load_whisper(model_name, prefer_gpu):
     global model_whisper
-    if prefer_gpu and not torch.cuda.is_available():
-        emit({"error": "GPU mode requested but no compatible GPU runtime was detected. Running on CPU."})
+    cuda_info = get_torch_cuda_info()
+    device, compute_type, runtime_reason = choose_faster_whisper_runtime(prefer_gpu)
 
-    device = "cuda" if (prefer_gpu and torch.cuda.is_available()) else "cpu"
-    compute_type = "float16" if device == "cuda" else "int8"
+    if prefer_gpu and device == "cpu":
+        emit({"log": "GPU mode requested for faster-whisper, but CUDA runtime is not available in this environment. Running faster-whisper on CPU."})
+
+    vram = cuda_info.get("vram_gb")
+    vram_text = f", vram_gb={vram}" if isinstance(vram, (int, float)) else ""
+    emit({"log": f"faster-whisper runtime: device={device}, compute_type={compute_type}, reason={runtime_reason}, prefer_gpu={prefer_gpu}, cuda_available={cuda_info['cuda_available']}, torch={cuda_info['torch_version']}, gpu={cuda_info['gpu_name']}{vram_text}"})
 
     emit({"status": "loading_model"})
 
