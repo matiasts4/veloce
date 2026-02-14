@@ -1,115 +1,95 @@
-# Guía Windows: instalación y despliegue en otros equipos
+# Guía Windows: instalación en equipo nuevo (todo en uno)
 
-Esta guía está pensada para replicar **la misma configuración** en múltiples PCs sin romper backend/modelos.
+Esta versión de Veloce se instala en Windows con instalador completo y motor embebido.
 
-## 1) Qué necesitas en el equipo destino
+## 1) Qué ejecutar en el equipo nuevo
 
-Mínimo recomendado:
+Usa uno de estos instaladores (solo uno):
+
+- `artifacts/windows/Veloce_0.1.0_x64-setup.exe` (recomendado)
+- `artifacts/windows/Veloce_0.1.0_x64_en-US.msi` (entornos corporativos)
+
+No es necesario ejecutar manualmente `audio-engine.exe` ni `veloce-runtime.exe` cuando instalas con setup/msi.
+
+## 2) Requisitos mínimos
 
 - Windows 10/11 x64.
-- `Python 3.10+` instalado y en `PATH`.
-- Micrófono habilitado en Windows.
+- Internet para primera descarga de modelo.
+- Micrófono permitido en configuración de privacidad de Windows.
 
-Opcional (solo para GPU AMD/NVIDIA con `whisper.cpp`):
+No requiere instalar Python manualmente para uso normal.
 
-- `whisper.cpp` compilado (Vulkan) + modelo `ggml/gguf` local.
+## 3) Primera ejecución (onboarding)
 
-## 2) Instalar la app (instalador)
+1. Abre Veloce.
+2. Descarga un modelo recomendado desde el onboarding.
+3. Espera a que termine y prueba captura.
 
-Usa el instalador generado en este proyecto:
-
-- `src-tauri/target/release/bundle/nsis/veloce_0.1.0_x64-setup.exe` (recomendado)
-- `src-tauri/target/release/bundle/msi/veloce_0.1.0_x64_en-US.msi`
-
-Recomendación de despliegue:
-
-1. Desinstalar versiones anteriores.
-2. Instalar la versión nueva.
-3. Abrir Veloce una vez para que cree configuración local.
-
-## 3) Configuración base estable (en la app)
+## 4) Configuración recomendada
 
 En `Configuración`:
 
-1. **Backend de inferencia**: `Auto`.
-2. **Modelo**: `large-v3-turbo` (o el que tengas descargado).
-3. **Ruta de modelos**: si usas modelos locales, apunta a carpeta (ejemplo: `C:/wsp/models`).
-4. Pulsa **Actualizar** para re-detectar hardware/modelos.
-5. (Opcional) Activa **Iniciar con Windows**.
+- Backend: `Auto`.
+- Modelo: `large-v3-turbo` (u otro detectado).
+- Ruta de modelos: seleccionar desde el desplegable detectado.
+- Atajo captura: `Home` (tecla única), si lo prefieres.
 
-## 4) Cómo descargar / preparar modelos
+## 5) Errores comunes y solución
 
-### Opción A: `faster-whisper` (CPU/CUDA)
+### Error al instalar: `Error opening file for writing ... _up_\dist\audio-engine.exe`
 
-- Descarga modelos desde Hugging Face (familia `faster-whisper`).
-- Luego en la app pulsa **Actualizar** para que aparezcan en la lista.
+Esto ocurre cuando una instancia previa dejó el engine en uso.
 
-### Opción B: `whisper.cpp` (recomendada en Windows + AMD)
+Pasos:
 
-Puedes usar el script incluido:
+1. Cierra Veloce.
+2. Abre Administrador de tareas y finaliza:
+   - `veloce.exe`
+   - `audio-engine.exe`
+3. Reintenta instalador.
+
+Si persiste, reinicia Windows y ejecuta nuevamente el setup.
+
+### App abre pero no transcribe
+
+1. Verifica permiso de micrófono en Windows.
+2. En Configuración, pulsa `Actualizar`.
+3. Comprueba que haya al menos un modelo descargado y seleccionado.
+
+### Se ven dos iconos distintos en barra de tareas
+
+Windows puede mantener caché de iconos antigua.
+
+1. Desancla Veloce de la barra.
+2. Cierra Veloce.
+3. Abre Veloce desde acceso directo nuevo del menú inicio.
+4. Vuelve a anclar.
+
+## 6) Entrega para otros equipos
+
+Para compartir por Git o ZIP, usa directamente:
+
+- `artifacts/windows/Veloce_0.1.0_x64-setup.exe`
+- `artifacts/windows/Veloce_0.1.0_x64_en-US.msi`
+
+Esto evita subir `src-tauri/target` completo y simplifica despliegue.
+
+## 7) Publicar en GitHub sin error de 100MB
+
+GitHub bloquea archivos mayores a 100MB en git normal (setup/msi de Veloce lo superan).
+
+Opciones recomendadas:
+
+1. **GitHub Releases (recomendado)**: subir `setup.exe` y `msi` como assets del release.
+2. **Git LFS**: si necesitas versionar binarios pesados dentro del repositorio.
+
+Comando para regenerar instaladores localmente:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\windows\setup-whispercpp.ps1 -Model large-v3-turbo
+npm run tauri build
 ```
 
-Esto deja:
+Salidas:
 
-- binarios `whisper.cpp`
-- modelo `ggml-large-v3-turbo.bin`
-- variables de entorno (`WHISPERCPP_EXE`, `WHISPERCPP_MODEL_DIR`)
-
-También puedes **no usar variables** y definir la carpeta en la app con **Ruta de modelos**.
-
-## 5) Checklist para que no se rompa
-
-En cada equipo nuevo valida:
-
-- La app abre y muestra estado `Listo`.
-- En `Configuración > Backend activo` aparece uno válido.
-- Hay modelos visibles en el selector.
-- `Actualizar` no muestra error de `Audio engine is not running`.
-
-## 6) Errores comunes y solución
-
-### “Audio engine is not running”
-
-Causa típica: Python no disponible en el equipo o bloqueo al iniciar sidecar.
-
-Solución:
-
-1. Verifica Python:
-   ```powershell
-   python --version
-   ```
-2. Reinicia app y usa **Actualizar**.
-3. Si persiste, reinstala Python 64-bit y vuelve a abrir la app.
-
-### “Audio engine script not found in dev/bundle paths”
-
-La app ya incluye fallback embebido, pero si aparece:
-
-1. Reinstala con el instalador más nuevo.
-2. Ejecuta la app una vez como usuario normal (crea archivos de app data).
-
-### No aparecen modelos
-
-1. Verifica `Ruta de modelos` en settings.
-2. Usa carpeta con archivos `ggml-*.bin` o `ggml-*.gguf`.
-3. Pulsa **Actualizar**.
-
-### Backend `whisper.cpp` no disponible
-
-1. Confirma ejecutable `whisper-cli.exe`.
-2. Confirma modelo en la carpeta configurada.
-3. Revisa guía detallada: `docs/WINDOWS_GPU_BACKEND.md`.
-
-## 7) Perfil recomendado para replicar en empresa/equipo
-
-- Backend: `Auto`
-- Modelo: `large-v3-turbo`
-- Ruta de modelos: carpeta estándar compartida (ej. `C:/wsp/models`)
-- Modo de captura: `Toggle`
-- Inicio con Windows: `ON`
-- Portapapeles: según política (`copiar` o `copiar+pegar`)
-
-Con ese perfil la app queda consistente entre equipos con mínima intervención manual.
+- `src-tauri/target/release/bundle/nsis/Veloce_0.1.0_x64-setup.exe`
+- `src-tauri/target/release/bundle/msi/Veloce_0.1.0_x64_en-US.msi`

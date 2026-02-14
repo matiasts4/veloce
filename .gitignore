@@ -34,6 +34,10 @@ target/
 target_temp/
 build/
 
+# Shared distributables (too large for regular git)
+artifacts/windows/*.exe
+artifacts/windows/*.msi
+
 # Python artifacts
 __pycache__/
 *.py[cod]

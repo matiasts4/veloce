@@ -7,6 +7,8 @@ import { TitleBar } from "@/components/veloce/title-bar";
 import { MicButton } from "@/components/veloce/mic-button";
 import { StatusPill } from "@/components/veloce/status-pill";
 import { SettingsModal } from "@/components/veloce/settings-modal";
+import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
 import {
   type HotkeyCombo,
   useHotkey,
@@ -16,13 +18,17 @@ type Status = "idle" | "listening" | "processing" | "transcribing";
 type UiLanguage = "es" | "en";
 type BackendId = "auto" | "faster-whisper" | "whispercpp";
 type CaptureMode = "toggle" | "hold";
+type CaptureShortcutType = "single" | "combo";
 type ExpandedViewSize = "compact" | "large";
+type ModelDownloadStatus = "idle" | "starting" | "downloading" | "completed" | "error";
+type ModelDownloadState = { progress: number; status: ModelDownloadStatus };
 
 const SETTINGS_KEY = "veloce:settings:v1";
-const NORMAL_WIDTH = 420;
-const NORMAL_HEIGHT = 520;
-const LARGE_WIDTH = 620;
-const LARGE_HEIGHT = 760;
+const ONBOARDING_DONE_KEY = "veloce:onboarding:done:v1";
+const NORMAL_WIDTH = 500;
+const NORMAL_HEIGHT = 620;
+const LARGE_WIDTH = 700;
+const LARGE_HEIGHT = 640;
 const MINI_WIDTH = 196;
 const MINI_HEIGHT = 52;
 
@@ -42,15 +48,9 @@ const DEFAULT_TOGGLE_CAPTURE: HotkeyCombo = {
   metaKey: false,
 };
 
-function isDefaultCaptureCombo(combo: HotkeyCombo | null) {
-  if (!combo) return false;
-  return (
-    combo.key === " " &&
-    combo.ctrlKey === true &&
-    combo.shiftKey === false &&
-    combo.altKey === false &&
-    combo.metaKey === false
-  );
+function inferShortcutType(combo: HotkeyCombo | null): CaptureShortcutType {
+  if (!combo) return "single";
+  return combo.ctrlKey || combo.shiftKey || combo.altKey || combo.metaKey ? "combo" : "single";
 }
 
 export default function VelocePage() {
@@ -67,17 +67,22 @@ export default function VelocePage() {
   const [microphone, setMicrophone] = useState("default");
   const [model, setModel] = useState("large-v3-turbo");
   const [modelDir, setModelDir] = useState("");
+  const [modelDirOptions, setModelDirOptions] = useState<string[]>([]);
   const [language, setLanguage] = useState("es");
   const [captureMode, setCaptureMode] = useState<CaptureMode>("toggle");
+  const [captureShortcutType, setCaptureShortcutType] = useState<CaptureShortcutType>("single");
   const [backend, setBackend] = useState<BackendId>("auto");
   const [activeBackend, setActiveBackend] = useState<BackendId | "none">("none");
   const [uiLanguage, setUiLanguage] = useState<UiLanguage>("es");
-  const [expandedViewSize, setExpandedViewSize] = useState<ExpandedViewSize>("compact");
+  const [expandedViewSize, setExpandedViewSize] = useState<ExpandedViewSize>("large");
   const [startWithWindows, setStartWithWindows] = useState(false);
   const [closeToMiniWidget, setCloseToMiniWidget] = useState(true);
   const [gpuEnabled, setGpuEnabled] = useState(false);
   const [availableMics, setAvailableMics] = useState<{ id: number; name: string }[]>([]);
   const [downloadedModels, setDownloadedModels] = useState<{ id: string; name: string; downloaded?: boolean }[]>([]);
+  const [modelDownloads, setModelDownloads] = useState<Record<string, ModelDownloadState>>({});
+  const [activeModelDownload, setActiveModelDownload] = useState<string | null>(null);
+  const activeModelDownloadRef = useRef<string | null>(null);
   const [gpuInfo, setGpuInfo] = useState<{ available: boolean; name: string; reason?: string }>({ available: false, name: "None", reason: "" });
   const [availableBackends, setAvailableBackends] = useState<{ id: BackendId; available: boolean; reason?: string }[]>([
     { id: "auto", available: true, reason: "" },
@@ -93,6 +98,7 @@ export default function VelocePage() {
   const [engineError, setEngineError] = useState("");
   const [engineLog, setEngineLog] = useState("");
   const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [onboardingOpen, setOnboardingOpen] = useState(false);
   const miniIsListening = isActive && status === "listening";
   const activeRecordingIdRef = useRef<number | null>(null);
 
@@ -226,7 +232,6 @@ export default function VelocePage() {
 
   // Register global hotkeys (disabled while recording a new keybind)
   useHotkey(toggleWidgetCombo, handleToggleVisibility, !isRecording);
-  useHotkey(toggleCaptureCombo, handleToggleCapture, !isRecording && !isDefaultCaptureCombo(toggleCaptureCombo));
 
   useEffect(() => {
     const html = document.documentElement;
@@ -248,12 +253,17 @@ export default function VelocePage() {
 
   // Listen to Tauri events
   useEffect(() => {
+    activeModelDownloadRef.current = activeModelDownload;
+  }, [activeModelDownload]);
+
+  useEffect(() => {
     let unlistenStatus: () => void;
     let unlistenRecording: () => void;
     let unlistenHardware: () => void;
     let unlistenTranscription: () => void;
     let unlistenError: () => void;
     let unlistenLog: () => void;
+    let unlistenModelDownload: () => void;
 
     import("@tauri-apps/api/event").then(async ({ listen }) => {
       unlistenStatus = await listen<string>("status-update", (event) => {
@@ -302,6 +312,42 @@ export default function VelocePage() {
         }
         if (Array.isArray(event.payload.models)) {
           setDownloadedModels(event.payload.models);
+          setModelDownloads((previous) => {
+            let hasChanges = false;
+            const next = { ...previous };
+            for (const item of event.payload.models) {
+              if (!item || typeof item.id !== "string") continue;
+              if (item.downloaded === true) {
+                const current = next[item.id];
+                if (!current || current.status !== "completed" || current.progress !== 100) {
+                  next[item.id] = { status: "completed", progress: 100 };
+                  hasChanges = true;
+                }
+              }
+            }
+            return hasChanges ? next : previous;
+          });
+          const currentActiveDownload = activeModelDownloadRef.current;
+          if (currentActiveDownload) {
+            const done = event.payload.models.some((item: { id?: string; downloaded?: boolean }) => item.id === currentActiveDownload && item.downloaded === true);
+            if (done) {
+              setActiveModelDownload(null);
+            }
+          }
+        }
+        if (Array.isArray(event.payload.model_dirs)) {
+          const options = event.payload.model_dirs
+            .filter((item: unknown) => typeof item === "string")
+            .map((item: string) => item.trim())
+            .filter((item: string) => item.length > 0);
+          setModelDirOptions(options);
+
+          if (!modelDir && typeof event.payload.default_model_dir === "string") {
+            const fallbackDir = event.payload.default_model_dir.trim();
+            if (fallbackDir.length > 0 && options.includes(fallbackDir)) {
+              setModelDir(fallbackDir);
+            }
+          }
         }
         if (event.payload.gpu) {
           setGpuInfo(event.payload.gpu);
@@ -398,11 +444,47 @@ export default function VelocePage() {
       });
 
       unlistenError = await listen<string>("engine-error", (event) => {
+        const message = event.payload ?? "";
+        if (message.includes("Model download failed (")) {
+          const modelMatch = message.match(/Model download failed \(([^)]+)\):/);
+          const failedModel = modelMatch?.[1] ?? activeModelDownloadRef.current;
+          if (failedModel) {
+            setModelDownloads((previous) => ({
+              ...previous,
+              [failedModel]: { status: "error", progress: 0 },
+            }));
+          }
+          setActiveModelDownload(null);
+        } else if (message.includes("Another model download is already in progress") && activeModelDownloadRef.current) {
+          setModelDownloads((previous) => ({
+            ...previous,
+            [activeModelDownloadRef.current as string]: { status: "error", progress: 0 },
+          }));
+          setActiveModelDownload(null);
+        }
         setEngineError(event.payload);
       });
 
       unlistenLog = await listen<string>("engine-log", (event) => {
         setEngineLog(event.payload);
+      });
+
+      unlistenModelDownload = await listen<{ model?: string; progress?: number }>("model-download-progress", (event) => {
+        const modelId = typeof event.payload?.model === "string" ? event.payload.model : "";
+        if (!modelId) return;
+
+        const progress = Math.max(0, Math.min(100, Number(event.payload?.progress ?? 0)));
+        setModelDownloads((previous) => ({
+          ...previous,
+          [modelId]: {
+            status: progress >= 100 ? "completed" : "downloading",
+            progress,
+          },
+        }));
+
+        if (progress >= 100) {
+          setActiveModelDownload(null);
+        }
       });
 
       const { invoke } = await import("@tauri-apps/api/core");
@@ -416,6 +498,7 @@ export default function VelocePage() {
       if (unlistenTranscription) unlistenTranscription();
       if (unlistenError) unlistenError();
       if (unlistenLog) unlistenLog();
+      if (unlistenModelDownload) unlistenModelDownload();
     };
   }, []);
 
@@ -432,6 +515,15 @@ export default function VelocePage() {
         }
         if (saved.captureMode === "toggle" || saved.captureMode === "hold") {
           setCaptureMode(saved.captureMode);
+        }
+        if (saved.captureShortcutType === "single" || saved.captureShortcutType === "combo") {
+          setCaptureShortcutType(saved.captureShortcutType);
+        } else {
+          const loadedCaptureCombo =
+            saved.toggleCaptureCombo && typeof saved.toggleCaptureCombo === "object"
+              ? (saved.toggleCaptureCombo as HotkeyCombo)
+              : DEFAULT_TOGGLE_CAPTURE;
+          setCaptureShortcutType(inferShortcutType(loadedCaptureCombo));
         }
         if (typeof saved.language === "string") setLanguage(saved.language);
         if (saved.uiLanguage === "es" || saved.uiLanguage === "en") setUiLanguage(saved.uiLanguage);
@@ -463,6 +555,7 @@ export default function VelocePage() {
         modelDir,
         backend,
         captureMode,
+        captureShortcutType,
         language,
         uiLanguage,
         expandedViewSize,
@@ -483,6 +576,7 @@ export default function VelocePage() {
     modelDir,
     backend,
     captureMode,
+    captureShortcutType,
     language,
     uiLanguage,
     expandedViewSize,
@@ -524,6 +618,29 @@ export default function VelocePage() {
   useEffect(() => {
     if (!settingsLoaded) return;
 
+    const onboardingDone = localStorage.getItem(ONBOARDING_DONE_KEY) === "1";
+    if (onboardingDone) {
+      setOnboardingOpen(false);
+      return;
+    }
+
+    const hasDownloadedModel = downloadedModels.some((item) => item.downloaded !== false);
+    setOnboardingOpen(!hasDownloadedModel);
+  }, [settingsLoaded, downloadedModels]);
+
+  useEffect(() => {
+    if (!settingsLoaded) return;
+
+    const hasDownloadedModel = downloadedModels.some((item) => item.downloaded !== false);
+    if (hasDownloadedModel) {
+      localStorage.setItem(ONBOARDING_DONE_KEY, "1");
+      setOnboardingOpen(false);
+    }
+  }, [settingsLoaded, downloadedModels]);
+
+  useEffect(() => {
+    if (!settingsLoaded) return;
+
     import("@tauri-apps/api/core")
       .then(({ invoke }) =>
         invoke("set_engine_settings", {
@@ -551,6 +668,22 @@ export default function VelocePage() {
         setEngineError(uiLanguage === "es" ? "No se pudo actualizar el modo de captura." : "Could not update capture mode.");
       });
   }, [settingsLoaded, captureMode, uiLanguage]);
+
+  useEffect(() => {
+    if (!settingsLoaded || !toggleCaptureCombo) return;
+
+    import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke("set_capture_hotkey", { hotkey: toggleCaptureCombo }))
+      .catch((error) => {
+        console.error("Failed to update capture hotkey", error);
+        setEngineError(uiLanguage === "es" ? "No se pudo actualizar el atajo global de captura." : "Could not update global capture hotkey.");
+      });
+  }, [settingsLoaded, toggleCaptureCombo, uiLanguage]);
+
+  useEffect(() => {
+    if (!settingsLoaded || !toggleCaptureCombo) return;
+    setCaptureShortcutType(inferShortcutType(toggleCaptureCombo));
+  }, [settingsLoaded, toggleCaptureCombo]);
 
   useEffect(() => {
     if (!settingsLoaded) return;
@@ -613,6 +746,39 @@ export default function VelocePage() {
     }
   }, [uiLanguage]);
 
+  const handleDownloadModel = useCallback(
+    async (modelId: string) => {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        setEngineError("");
+        setActiveModelDownload(modelId);
+        setModelDownloads((previous) => ({
+          ...previous,
+          [modelId]: { status: "starting", progress: 0 },
+        }));
+        await invoke("download_model", { model: modelId });
+      } catch (error) {
+        console.error("Failed to start model download", error);
+        setModelDownloads((previous) => ({
+          ...previous,
+          [modelId]: { status: "error", progress: 0 },
+        }));
+        setActiveModelDownload(null);
+        setEngineError(uiLanguage === "es" ? "No se pudo iniciar la descarga del modelo." : "Could not start model download.");
+      }
+    },
+    [uiLanguage]
+  );
+
+  const isAnyModelDownloading = Object.values(modelDownloads).some(
+    (item) => item.status === "starting" || item.status === "downloading"
+  );
+
+  const recommendedOnboardingModel = "large-v3-turbo";
+  const onboardingProgress = modelDownloads[recommendedOnboardingModel]?.progress ?? 0;
+  const onboardingStatus = modelDownloads[recommendedOnboardingModel]?.status ?? "idle";
+  const onboardingBusy = onboardingStatus === "starting" || onboardingStatus === "downloading";
+
   const handleSaveSettings = useCallback(() => {
     try {
       localStorage.setItem(
@@ -623,6 +789,7 @@ export default function VelocePage() {
           modelDir,
           backend,
           captureMode,
+          captureShortcutType,
           language,
           uiLanguage,
           expandedViewSize,
@@ -647,6 +814,7 @@ export default function VelocePage() {
     modelDir,
     backend,
     captureMode,
+    captureShortcutType,
     language,
     uiLanguage,
     expandedViewSize,
@@ -686,17 +854,19 @@ export default function VelocePage() {
             />
             <div onMouseDown={handleStartWindowDrag} className="h-4 w-full cursor-grab" aria-label="Drag strip" />
 
-            <div className="flex flex-col items-center">
+            <div className="flex h-[calc(100%-4.75rem)] w-full flex-col items-center">
               <MicButton isActive={isActive} status={status} onToggle={handleToggleCapture} />
               <StatusPill status={status} uiLanguage={uiLanguage} />
-              <div className="w-full px-4 pb-4">
-                <div className="rounded-md border border-border/60 bg-secondary/30 px-3 py-2">
+              <div className="mt-2 flex w-full flex-1 px-4 pb-4">
+                <div className="flex h-full min-h-[11rem] w-full flex-col rounded-md border border-border/60 bg-secondary/30 px-3 py-2">
                   <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground/90">
                     {uiLanguage === "es" ? "Última transcripción" : "Latest transcription"}
                   </p>
-                  <p className="mt-1 min-h-10 text-xs text-foreground/90">
-                    {latestTranscript || (uiLanguage === "es" ? "Aún no hay texto transcrito." : "No transcribed text yet.")}
-                  </p>
+                  <div className="mt-1 flex-1 overflow-y-auto pr-1">
+                    <p className="text-xs text-foreground/90 whitespace-pre-wrap break-words">
+                      {latestTranscript || (uiLanguage === "es" ? "Aún no hay texto transcrito." : "No transcribed text yet.")}
+                    </p>
+                  </div>
                   {showResponseTimes && lastResponseMs !== null ? (
                     <p className="mt-1 text-[11px] text-muted-foreground">
                       {uiLanguage === "es" ? `Tiempo de respuesta: ${lastResponseMs} ms` : `Response time: ${lastResponseMs} ms`}
@@ -711,6 +881,64 @@ export default function VelocePage() {
                 </div>
               </div>
             </div>
+
+            {onboardingOpen ? (
+              <div className="absolute inset-0 z-20 flex items-center justify-center bg-card/92 p-4">
+                <div className="w-full max-w-sm rounded-2xl border border-border bg-card p-4">
+                  <h3 className="font-mono text-xs uppercase tracking-wider text-foreground">
+                    {uiLanguage === "es" ? "Configuración inicial" : "Initial setup"}
+                  </h3>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    {uiLanguage === "es"
+                      ? "Vamos a dejar Veloce listo en este equipo. Descarga el modelo recomendado para comenzar a transcribir."
+                      : "Let’s prepare Veloce on this machine. Download the recommended model to start transcribing."}
+                  </p>
+
+                  <div className="mt-4 rounded-lg border border-border bg-secondary/40 p-3">
+                    <p className="text-xs text-foreground">large-v3-turbo</p>
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      {uiLanguage === "es" ? "Recomendado: velocidad + precisión" : "Recommended: speed + accuracy"}
+                    </p>
+                    {onboardingBusy ? (
+                      <div className="mt-2">
+                        <Progress value={onboardingProgress} className="h-1.5" />
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          {uiLanguage === "es" ? `Descargando ${onboardingProgress}%` : `Downloading ${onboardingProgress}%`}
+                        </p>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="mt-4 flex gap-2">
+                    <Button
+                      type="button"
+                      className="flex-1"
+                      disabled={onboardingBusy || isAnyModelDownloading || onboardingStatus === "completed"}
+                      onClick={() => handleDownloadModel(recommendedOnboardingModel)}
+                    >
+                      {onboardingStatus === "completed"
+                        ? (uiLanguage === "es" ? "Modelo listo" : "Model ready")
+                        : onboardingBusy
+                          ? (uiLanguage === "es" ? "Descargando" : "Downloading")
+                          : (uiLanguage === "es" ? "Descargar modelo" : "Download model")}
+                    </Button>
+                    <Button type="button" variant="outline" onClick={() => setSettingsOpen(true)}>
+                      {uiLanguage === "es" ? "Opciones" : "Options"}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      onClick={() => {
+                        localStorage.setItem(ONBOARDING_DONE_KEY, "1");
+                        setOnboardingOpen(false);
+                      }}
+                    >
+                      {uiLanguage === "es" ? "Omitir" : "Skip"}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
 
             {/* Bottom accent line */}
             <div className="absolute inset-x-0 bottom-0 h-px bg-gradient-to-r from-transparent via-primary/20 to-transparent" />
@@ -809,10 +1037,13 @@ export default function VelocePage() {
         onModelChange={setModel}
         modelDir={modelDir}
         onModelDirChange={setModelDir}
+        modelDirOptions={modelDirOptions}
         backend={backend}
         onBackendChange={setBackend}
         captureMode={captureMode}
         onCaptureModeChange={setCaptureMode}
+        captureShortcutType={captureShortcutType}
+        onCaptureShortcutTypeChange={setCaptureShortcutType}
         activeBackend={activeBackend}
         language={language}
         onLanguageChange={setLanguage}
@@ -833,6 +1064,9 @@ export default function VelocePage() {
         onRecordingChange={setIsRecording}
         availableMics={availableMics}
         downloadedModels={downloadedModels}
+        modelDownloads={modelDownloads}
+        isAnyModelDownloading={isAnyModelDownloading}
+        onDownloadModel={handleDownloadModel}
         showResponseTimes={showResponseTimes}
         onShowResponseTimesChange={setShowResponseTimes}
         gpuInfo={gpuInfo}

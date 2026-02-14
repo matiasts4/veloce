@@ -28,8 +28,8 @@ RATE = 16000
 CHUNK = 512
 SILENCE_THRESHOLD = 0.018  # RMS threshold in normalized float audio
 SILENCE_DURATION = 0.45    # Seconds of silence to trigger segmented transcription
-MAX_BUFFER_SECONDS = 20  # Prevent huge allocations on long recordings
-PRE_ROLL_SECONDS = 1.5
+MAX_BUFFER_SECONDS = 120  # Prevent huge allocations on very long recordings
+PRE_ROLL_SECONDS = 2.2
 WHISPERCPP_SERVER_HOST = "127.0.0.1"
 WHISPERCPP_SERVER_PORT = 8178
 WHISPERCPP_SERVER_HEALTH_TIMEOUT = 30.0
@@ -533,6 +533,48 @@ def get_downloaded_models():
     models.sort(key=lambda model: model["id"])
     return models
 
+
+def get_model_directory_options() -> list[str]:
+    options: list[str] = []
+    seen: set[str] = set()
+
+    def add_path(path_value):
+        if not path_value:
+            return
+        try:
+            candidate = Path(path_value).expanduser().resolve()
+        except Exception:
+            return
+
+        if not candidate.exists() or not candidate.is_dir():
+            return
+
+        normalized = str(candidate)
+        if normalized in seen:
+            return
+
+        seen.add(normalized)
+        options.append(normalized)
+
+    add_path(selected_model_dir)
+    add_path(os.environ.get("WHISPERCPP_MODEL_DIR"))
+    add_path(get_whispercpp_model_dir())
+
+    home = Path.home()
+    hf_candidates = [
+        home / ".cache" / "huggingface" / "hub",
+        home / "AppData" / "Local" / "huggingface" / "hub",
+    ]
+
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        hf_candidates.insert(0, Path(hf_home) / "hub")
+
+    for candidate in hf_candidates:
+        add_path(candidate)
+
+    return options
+
 def get_hardware_info():
     """Fetch available microphones and GPU status."""
     global selected_backend, active_backend
@@ -623,7 +665,9 @@ def get_hardware_info():
                 },
             ],
         },
-        "models": sorted(list(merged_models.values()), key=lambda model: model["id"])
+        "models": sorted(list(merged_models.values()), key=lambda model: model["id"]),
+        "model_dirs": get_model_directory_options(),
+        "default_model_dir": str(get_whispercpp_model_dir()),
     }
 
 
@@ -1071,7 +1115,7 @@ def transcribe(buffer):
         segments, info = model.transcribe(
             audio_float32,
             beam_size=beam_size,
-            vad_filter=True,
+            vad_filter=False,
             language=language,
             task="transcribe",
         )

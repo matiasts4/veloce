@@ -13,7 +13,7 @@ export function MicButton({ isActive, status = "idle", onToggle }: MicButtonProp
   const isTranscribing = status === "transcribing" || status === "processing";
 
   return (
-    <div className="relative flex items-center justify-center py-10">
+    <div className="relative flex items-center justify-center py-6">
       {/* Outer pulse rings - only when active */}
       <AnimatePresence>
         {(isActive || isTranscribing) && (

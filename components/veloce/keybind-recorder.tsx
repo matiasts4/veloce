@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 interface KeybindRecorderProps {
   value: HotkeyCombo | null;
   onChange: (combo: HotkeyCombo | null) => void;
+  mode?: "any" | "single" | "combo";
   /** Fires when the user starts / stops recording so the parent can pause global hotkeys */
   onRecordingChange?: (recording: boolean) => void;
 }
@@ -14,6 +15,7 @@ interface KeybindRecorderProps {
 export function KeybindRecorder({
   value,
   onChange,
+  mode = "any",
   onRecordingChange,
 }: KeybindRecorderProps) {
   const [recording, setRecording] = useState(false);
@@ -31,8 +33,19 @@ export function KeybindRecorder({
     const handleKeydown = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
-      const combo = comboFromEvent(e);
-      if (combo) {
+      const captured = comboFromEvent(e);
+      if (captured) {
+        const combo =
+          mode === "single"
+            ? {
+                key: captured.key,
+                ctrlKey: false,
+                shiftKey: false,
+                altKey: false,
+                metaKey: false,
+              }
+            : captured;
+
         onChange(combo);
         setRecording(false);
       }
@@ -51,7 +64,7 @@ export function KeybindRecorder({
       window.removeEventListener("keydown", handleKeydown, true);
       window.removeEventListener("mousedown", handleClick, true);
     };
-  }, [recording, onChange]);
+  }, [recording, onChange, mode]);
 
   return (
     <button

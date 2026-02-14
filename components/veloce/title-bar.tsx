@@ -1,6 +1,7 @@
 "use client";
 
 import { Settings, Minus, X } from "lucide-react";
+import { BrandMark } from "@/components/veloce/brand-mark";
 
 interface TitleBarProps {
   onOpenSettings: () => void;
@@ -22,9 +23,10 @@ export function TitleBar({ onOpenSettings, onMinimize, onClose, onDragMouseDown 
 
       <div
         data-tauri-drag-region
-        className="flex h-8 flex-1 cursor-grab select-none items-center justify-center text-center"
+        className="flex h-8 flex-1 cursor-grab select-none items-center justify-center gap-2 text-center"
         aria-label="Drag area"
       >
+        <BrandMark className="h-5 w-5" />
         <span className="font-mono text-xs font-medium tracking-widest uppercase text-muted-foreground">
           Veloce
         </span>

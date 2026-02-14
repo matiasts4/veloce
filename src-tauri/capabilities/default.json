@@ -25,6 +25,11 @@
                     "name": "run-python",
                     "cmd": "python",
                     "args": true
+                },
+                {
+                    "name": "run-audio-engine",
+                    "cmd": "audio-engine.exe",
+                    "args": true
                 }
             ]
         }

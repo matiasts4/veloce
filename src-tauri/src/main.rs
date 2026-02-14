@@ -1,7 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri::{AppHandle, Manager, Emitter, Runtime};
+use tauri::{AppHandle, Manager, Emitter, Runtime, WindowEvent};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutEvent, ShortcutState};
 // Note: Imports might vary based on exact plugin version. 
 // Assuming tauri-plugin-global-shortcut 2.x
@@ -31,12 +31,144 @@ struct AppState {
     sidecar_child: Arc<Mutex<Option<CommandChild>>>,
     recording: Arc<Mutex<bool>>,
     capture_mode: Arc<Mutex<String>>,
+    capture_shortcut: Arc<Mutex<Option<Shortcut>>>,
     clipboard_mode: Arc<Mutex<bool>>,
     clipboard_auto_paste: Arc<Mutex<bool>>,
     engine_settings: Arc<Mutex<EngineSettings>>,
 }
 
 const EMBEDDED_AUDIO_ENGINE: &str = include_str!("../../python/audio_engine.py");
+
+#[derive(serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct HotkeyConfig {
+    key: String,
+    ctrl_key: bool,
+    shift_key: bool,
+    alt_key: bool,
+    meta_key: bool,
+}
+
+fn key_to_code(key: &str) -> Option<Code> {
+    let normalized = key.trim().to_lowercase();
+    match normalized.as_str() {
+        " " | "space" => Some(Code::Space),
+        "home" => Some(Code::Home),
+        "end" => Some(Code::End),
+        "insert" => Some(Code::Insert),
+        "delete" => Some(Code::Delete),
+        "enter" => Some(Code::Enter),
+        "tab" => Some(Code::Tab),
+        "backspace" => Some(Code::Backspace),
+        "escape" | "esc" => Some(Code::Escape),
+        "arrowup" | "up" => Some(Code::ArrowUp),
+        "arrowdown" | "down" => Some(Code::ArrowDown),
+        "arrowleft" | "left" => Some(Code::ArrowLeft),
+        "arrowright" | "right" => Some(Code::ArrowRight),
+        "f1" => Some(Code::F1),
+        "f2" => Some(Code::F2),
+        "f3" => Some(Code::F3),
+        "f4" => Some(Code::F4),
+        "f5" => Some(Code::F5),
+        "f6" => Some(Code::F6),
+        "f7" => Some(Code::F7),
+        "f8" => Some(Code::F8),
+        "f9" => Some(Code::F9),
+        "f10" => Some(Code::F10),
+        "f11" => Some(Code::F11),
+        "f12" => Some(Code::F12),
+        "0" => Some(Code::Digit0),
+        "1" => Some(Code::Digit1),
+        "2" => Some(Code::Digit2),
+        "3" => Some(Code::Digit3),
+        "4" => Some(Code::Digit4),
+        "5" => Some(Code::Digit5),
+        "6" => Some(Code::Digit6),
+        "7" => Some(Code::Digit7),
+        "8" => Some(Code::Digit8),
+        "9" => Some(Code::Digit9),
+        "a" => Some(Code::KeyA),
+        "b" => Some(Code::KeyB),
+        "c" => Some(Code::KeyC),
+        "d" => Some(Code::KeyD),
+        "e" => Some(Code::KeyE),
+        "f" => Some(Code::KeyF),
+        "g" => Some(Code::KeyG),
+        "h" => Some(Code::KeyH),
+        "i" => Some(Code::KeyI),
+        "j" => Some(Code::KeyJ),
+        "k" => Some(Code::KeyK),
+        "l" => Some(Code::KeyL),
+        "m" => Some(Code::KeyM),
+        "n" => Some(Code::KeyN),
+        "o" => Some(Code::KeyO),
+        "p" => Some(Code::KeyP),
+        "q" => Some(Code::KeyQ),
+        "r" => Some(Code::KeyR),
+        "s" => Some(Code::KeyS),
+        "t" => Some(Code::KeyT),
+        "u" => Some(Code::KeyU),
+        "v" => Some(Code::KeyV),
+        "w" => Some(Code::KeyW),
+        "x" => Some(Code::KeyX),
+        "y" => Some(Code::KeyY),
+        "z" => Some(Code::KeyZ),
+        _ => None,
+    }
+}
+
+fn shortcut_from_config(config: &HotkeyConfig) -> Result<Shortcut, String> {
+    let code = key_to_code(&config.key)
+        .ok_or_else(|| format!("Hotkey no soportada: {}", config.key))?;
+
+    let mut modifiers = Modifiers::empty();
+    if config.ctrl_key {
+        modifiers |= Modifiers::CONTROL;
+    }
+    if config.shift_key {
+        modifiers |= Modifiers::SHIFT;
+    }
+    if config.alt_key {
+        modifiers |= Modifiers::ALT;
+    }
+    if config.meta_key {
+        modifiers |= Modifiers::SUPER;
+    }
+
+    if modifiers.is_empty() {
+        Ok(Shortcut::new(None, code))
+    } else {
+        Ok(Shortcut::new(Some(modifiers), code))
+    }
+}
+
+fn register_capture_shortcut<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &tauri::State<AppState>,
+    config: HotkeyConfig,
+) -> Result<(), String> {
+    let new_shortcut = shortcut_from_config(&config)?;
+
+    let mut lock = state.capture_shortcut.lock().map_err(|e| e.to_string())?;
+    if let Some(previous_shortcut) = lock.take() {
+        let _ = app.global_shortcut().unregister(previous_shortcut);
+    }
+
+    app.global_shortcut()
+        .register(new_shortcut)
+        .map_err(|error| format!("No se pudo registrar el atajo global: {error}"))?;
+
+    *lock = Some(new_shortcut);
+    Ok(())
+}
+
+fn stop_audio_engine(state: &tauri::State<AppState>) {
+    if let Ok(mut lock) = state.sidecar_child.lock() {
+        if let Some(child) = lock.take() {
+            let _ = child.kill();
+        }
+    }
+}
 
 #[cfg(windows)]
 fn set_startup_enabled_on_windows(enabled: bool) -> Result<(), String> {
@@ -117,6 +249,38 @@ fn write_engine_command(state: &tauri::State<AppState>, command: &str) -> Result
     Ok(())
 }
 
+fn resolve_audio_engine_executable<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    let mut executable_candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        executable_candidates.push(current_dir.join("dist/audio-engine.exe"));
+        executable_candidates.push(current_dir.join("audio-engine.exe"));
+        executable_candidates.push(current_dir.join("../dist/audio-engine.exe"));
+    }
+
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(exe_dir) = executable.parent() {
+            executable_candidates.push(exe_dir.join("audio-engine.exe"));
+            executable_candidates.push(exe_dir.join("dist/audio-engine.exe"));
+            executable_candidates.push(exe_dir.join("_up_/audio-engine.exe"));
+            executable_candidates.push(exe_dir.join("_up_/dist/audio-engine.exe"));
+            executable_candidates.push(exe_dir.join("resources/audio-engine.exe"));
+            executable_candidates.push(exe_dir.join("resources/dist/audio-engine.exe"));
+        }
+    }
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        executable_candidates.push(resource_dir.join("audio-engine.exe"));
+        executable_candidates.push(resource_dir.join("dist/audio-engine.exe"));
+        executable_candidates.push(resource_dir.join("resources/audio-engine.exe"));
+        executable_candidates.push(resource_dir.join("resources/dist/audio-engine.exe"));
+    }
+
+    executable_candidates
+        .into_iter()
+        .find(|path| path.exists() && path.is_file())
+}
+
 fn resolve_audio_engine_script<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
     let mut script_candidates: Vec<PathBuf> = Vec::new();
 
@@ -155,17 +319,23 @@ fn spawn_audio_engine<R: Runtime>(app_handle: &AppHandle<R>, child_arc: Arc<Mute
         }
     }
 
-    let script_path = resolve_audio_engine_script(app_handle)
-        .ok_or_else(|| "Audio engine script not found in dev/bundle paths".to_string())?;
+    let sidecar_command = if let Some(engine_executable) = resolve_audio_engine_executable(app_handle) {
+        app_handle
+            .shell()
+            .command(engine_executable.to_string_lossy().to_string())
+    } else {
+        let script_path = resolve_audio_engine_script(app_handle)
+            .ok_or_else(|| "Audio engine executable/script not found in dev/bundle paths".to_string())?;
 
-    let sidecar_command = app_handle
-        .shell()
-        .command("python")
-        .args([script_path.to_string_lossy().to_string()]);
+        app_handle
+            .shell()
+            .command("python")
+            .args([script_path.to_string_lossy().to_string()])
+    };
 
     let (mut rx, child) = sidecar_command
         .spawn()
-        .map_err(|error| format!("No se pudo iniciar el motor de audio. Verifica Python instalado. Detalle: {error}"))?;
+        .map_err(|error| format!("No se pudo iniciar el motor de audio embebido. Detalle: {error}"))?;
 
     if let Ok(mut lock) = child_arc.lock() {
         *lock = Some(child);
@@ -313,6 +483,12 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(handle_shortcut).build())
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { .. } = event {
+                let state = window.state::<AppState>();
+                stop_audio_engine(&state);
+            }
+        })
         .setup(|app| {
             let app_handle = app.handle();
             // Store child in state
@@ -324,6 +500,7 @@ fn main() {
                 sidecar_child: child_arc.clone(),
                 recording: Arc::new(Mutex::new(false)),
                 capture_mode: Arc::new(Mutex::new("toggle".to_string())),
+                capture_shortcut: Arc::new(Mutex::new(None)),
                 clipboard_mode: clipboard_mode.clone(),
                 clipboard_auto_paste: clipboard_auto_paste.clone(),
                 engine_settings: Arc::new(Mutex::new(EngineSettings {
@@ -341,15 +518,20 @@ fn main() {
             }
             
             // Register Shortcuts
-            let shortcut_record = Shortcut::new(Some(Modifiers::CONTROL), Code::Space);
-            let shortcut_record_home = Shortcut::new(None, Code::Home);
             let shortcut_focus = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyV);
 
-            if let Err(error) = app.global_shortcut().register(shortcut_record) {
+            if let Err(error) = register_capture_shortcut(
+                &app_handle,
+                &app_handle.state::<AppState>(),
+                HotkeyConfig {
+                    key: " ".to_string(),
+                    ctrl_key: true,
+                    shift_key: false,
+                    alt_key: false,
+                    meta_key: false,
+                },
+            ) {
                 eprintln!("Failed to register capture shortcut: {error}");
-            }
-            if let Err(error) = app.global_shortcut().register(shortcut_record_home) {
-                eprintln!("Failed to register Home capture shortcut: {error}");
             }
             if let Err(error) = app.global_shortcut().register(shortcut_focus) {
                 eprintln!("Failed to register focus shortcut: {error}");
@@ -357,7 +539,7 @@ fn main() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![set_clipboard_settings, toggle_recording, set_capture_mode, set_engine_settings, refresh_hardware, download_model, get_startup_enabled, set_startup_enabled])
+        .invoke_handler(tauri::generate_handler![set_clipboard_settings, toggle_recording, set_capture_mode, set_capture_hotkey, set_engine_settings, refresh_hardware, download_model, get_startup_enabled, set_startup_enabled])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -402,6 +584,11 @@ fn set_capture_mode(state: tauri::State<AppState>, mode: String) -> Result<(), S
     let mut lock = state.capture_mode.lock().map_err(|e| e.to_string())?;
     *lock = effective.to_string();
     Ok(())
+}
+
+#[tauri::command]
+fn set_capture_hotkey(app: AppHandle, state: tauri::State<AppState>, hotkey: HotkeyConfig) -> Result<(), String> {
+    register_capture_shortcut(&app, &state, hotkey)
 }
 
 #[tauri::command]
@@ -470,9 +657,23 @@ fn set_startup_enabled(enabled: bool) -> Result<(), String> {
 
 #[tauri::command]
 fn download_model(app: AppHandle, state: tauri::State<AppState>, model: String) -> Result<(), String> {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("Model name is required".to_string());
+    }
+
+    if state.sidecar_child.lock().map_err(|e| e.to_string())?.is_none() {
+        if let Err(error) = spawn_audio_engine(&app, state.sidecar_child.clone()) {
+            let _ = app.emit("engine-error", error.clone());
+            return Err(error);
+        }
+    }
+
     let cmd = format!("DOWNLOAD {}\n", model);
     if let Err(error) = write_engine_command(&state, &cmd) {
-        let _ = app.emit("engine-error", format!("No se pudo descargar el modelo {model}: {error}"));
+        let message = format!("No se pudo descargar el modelo {model}: {error}");
+        let _ = app.emit("engine-error", message.clone());
+        return Err(message);
     } else {
         let _ = app.emit("engine-log", format!("Descargando modelo: {model}"));
     }
@@ -480,8 +681,24 @@ fn download_model(app: AppHandle, state: tauri::State<AppState>, model: String) 
 }
 
 fn handle_shortcut<R: Runtime>(app: &AppHandle<R>, shortcut: &Shortcut, event: ShortcutEvent) {
-    if shortcut.matches(Modifiers::CONTROL, Code::Space) || shortcut.matches(Modifiers::empty(), Code::Home) {
-        let state = app.state::<AppState>();
+    let state = app.state::<AppState>();
+    let capture_shortcut = state
+        .capture_shortcut
+        .lock()
+        .map(|value| value.clone())
+        .unwrap_or(None);
+
+    if let Some(active_capture_shortcut) = capture_shortcut {
+        if *shortcut != active_capture_shortcut {
+            if shortcut.matches(Modifiers::CONTROL | Modifiers::ALT, Code::KeyV) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_focus();
+                    let _ = window.unminimize();
+                }
+            }
+            return;
+        }
+
         let capture_mode = state
             .capture_mode
             .lock()
@@ -557,7 +774,10 @@ fn handle_shortcut<R: Runtime>(app: &AppHandle<R>, shortcut: &Shortcut, event: S
         }
 
         let _ = app.emit("recording-state", *recording);
-    } else if shortcut.matches(Modifiers::CONTROL | Modifiers::ALT, Code::KeyV) {
+        return;
+    }
+
+    if shortcut.matches(Modifiers::CONTROL | Modifiers::ALT, Code::KeyV) {
         // Focus Window
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.set_focus();
