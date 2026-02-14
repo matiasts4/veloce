@@ -10,6 +10,7 @@
         "core:window:allow-start-dragging",
         "core:window:allow-close",
         "core:window:allow-set-size",
+        "core:window:allow-set-resizable",
         "core:window:allow-set-always-on-top",
         "shell:default",
         "shell:allow-open",

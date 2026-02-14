@@ -1,4 +1,4 @@
-# Migración completa a Linux (Veloz Voice)
+# Migración completa a Linux (Veloce)
 
 Esta guía te deja el proyecto listo para desarrollo diario en Linux, evitando subir artefactos pesados a Git.
 
@@ -103,7 +103,7 @@ bun run tauri dev
 Si hay puertos/procesos colgados:
 
 ```bash
-pkill -f "next|bun|cargo|veloz-voice" || true
+pkill -f "next|bun|cargo|veloce" || true
 rm -f .next/dev/lock
 bun run tauri dev
 ```

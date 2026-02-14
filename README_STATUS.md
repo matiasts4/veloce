@@ -1,4 +1,4 @@
-# VelozVoice Project Status
+# Veloce Project Status
 
 **Current State**: Configuration complete, awaiting environment fix.
 

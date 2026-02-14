@@ -3,10 +3,10 @@
 import { useState, useCallback, useEffect, useRef, type MouseEvent as ReactMouseEvent } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { AudioLines, Check, Mic, X } from "lucide-react";
-import { TitleBar } from "@/components/veloz/title-bar";
-import { MicButton } from "@/components/veloz/mic-button";
-import { StatusPill } from "@/components/veloz/status-pill";
-import { SettingsModal } from "@/components/veloz/settings-modal";
+import { TitleBar } from "@/components/veloce/title-bar";
+import { MicButton } from "@/components/veloce/mic-button";
+import { StatusPill } from "@/components/veloce/status-pill";
+import { SettingsModal } from "@/components/veloce/settings-modal";
 import {
   type HotkeyCombo,
   useHotkey,
@@ -14,10 +14,15 @@ import {
 
 type Status = "idle" | "listening" | "processing" | "transcribing";
 type UiLanguage = "es" | "en";
+type BackendId = "auto" | "faster-whisper" | "whispercpp";
+type CaptureMode = "toggle" | "hold";
+type ExpandedViewSize = "compact" | "large";
 
-const SETTINGS_KEY = "velozvoice:settings:v1";
+const SETTINGS_KEY = "veloce:settings:v1";
 const NORMAL_WIDTH = 420;
 const NORMAL_HEIGHT = 520;
+const LARGE_WIDTH = 620;
+const LARGE_HEIGHT = 760;
 const MINI_WIDTH = 196;
 const MINI_HEIGHT = 52;
 
@@ -37,7 +42,18 @@ const DEFAULT_TOGGLE_CAPTURE: HotkeyCombo = {
   metaKey: false,
 };
 
-export default function VelozVoicePage() {
+function isDefaultCaptureCombo(combo: HotkeyCombo | null) {
+  if (!combo) return false;
+  return (
+    combo.key === " " &&
+    combo.ctrlKey === true &&
+    combo.shiftKey === false &&
+    combo.altKey === false &&
+    combo.metaKey === false
+  );
+}
+
+export default function VelocePage() {
   const [isVisible, setIsVisible] = useState(true);
   const [showMiniWidget, setShowMiniWidget] = useState(false);
   const [isActive, setIsActive] = useState(false);
@@ -50,14 +66,26 @@ export default function VelozVoicePage() {
   // Settings state
   const [microphone, setMicrophone] = useState("default");
   const [model, setModel] = useState("large-v3-turbo");
+  const [modelDir, setModelDir] = useState("");
   const [language, setLanguage] = useState("es");
+  const [captureMode, setCaptureMode] = useState<CaptureMode>("toggle");
+  const [backend, setBackend] = useState<BackendId>("auto");
+  const [activeBackend, setActiveBackend] = useState<BackendId | "none">("none");
   const [uiLanguage, setUiLanguage] = useState<UiLanguage>("es");
+  const [expandedViewSize, setExpandedViewSize] = useState<ExpandedViewSize>("compact");
+  const [startWithWindows, setStartWithWindows] = useState(false);
   const [closeToMiniWidget, setCloseToMiniWidget] = useState(true);
   const [gpuEnabled, setGpuEnabled] = useState(false);
   const [availableMics, setAvailableMics] = useState<{ id: number; name: string }[]>([]);
   const [downloadedModels, setDownloadedModels] = useState<{ id: string; name: string; downloaded?: boolean }[]>([]);
-  const [gpuInfo, setGpuInfo] = useState<{ available: boolean; name: string }>({ available: false, name: "None" });
+  const [gpuInfo, setGpuInfo] = useState<{ available: boolean; name: string; reason?: string }>({ available: false, name: "None", reason: "" });
+  const [availableBackends, setAvailableBackends] = useState<{ id: BackendId; available: boolean; reason?: string }[]>([
+    { id: "auto", available: true, reason: "" },
+    { id: "faster-whisper", available: true, reason: "" },
+    { id: "whispercpp", available: false, reason: "" },
+  ]);
   const [clipboardMode, setClipboardMode] = useState(false);
+  const [clipboardAutoPaste, setClipboardAutoPaste] = useState(false);
   const [showResponseTimes, setShowResponseTimes] = useState(false);
   const [latestTranscript, setLatestTranscript] = useState("");
   const [lastResponseMs, setLastResponseMs] = useState<number | null>(null);
@@ -74,6 +102,14 @@ export default function VelozVoicePage() {
   const [toggleCaptureCombo, setToggleCaptureCombo] =
     useState<HotkeyCombo | null>(DEFAULT_TOGGLE_CAPTURE);
 
+  const getExpandedWindowSize = useCallback(
+    () =>
+      expandedViewSize === "large"
+        ? { width: LARGE_WIDTH, height: LARGE_HEIGHT }
+        : { width: NORMAL_WIDTH, height: NORMAL_HEIGHT },
+    [expandedViewSize]
+  );
+
   // Toggle widget between normal and mini mode
   const handleToggleVisibility = useCallback(() => {
     if (isVisible) {
@@ -86,6 +122,7 @@ export default function VelozVoicePage() {
           const { LogicalSize } = dpiApi;
           const window = getCurrentWindow();
           await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
+          await window.setResizable(false);
           await window.setAlwaysOnTop(true);
         })
         .catch((error) => console.error("Failed to minimize from hotkey", error));
@@ -100,11 +137,13 @@ export default function VelozVoicePage() {
         const { getCurrentWindow } = windowApi;
         const { LogicalSize } = dpiApi;
         const window = getCurrentWindow();
+        const target = getExpandedWindowSize();
         await window.setAlwaysOnTop(false);
-        await window.setSize(new LogicalSize(NORMAL_WIDTH, NORMAL_HEIGHT));
+        await window.setResizable(true);
+        await window.setSize(new LogicalSize(target.width, target.height));
       })
       .catch((error) => console.error("Failed to restore from hotkey", error));
-  }, [isVisible]);
+  }, [getExpandedWindowSize, isVisible]);
 
   const handleMinimizeToMiniWidget = useCallback(() => {
     setIsVisible(false);
@@ -116,6 +155,7 @@ export default function VelozVoicePage() {
         const { LogicalSize } = dpiApi;
         const window = getCurrentWindow();
         await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
+        await window.setResizable(false);
         await window.setAlwaysOnTop(true);
       })
       .catch((error) => console.error("Failed to minimize to mini widget", error));
@@ -130,11 +170,13 @@ export default function VelozVoicePage() {
         const { getCurrentWindow } = windowApi;
         const { LogicalSize } = dpiApi;
         const window = getCurrentWindow();
+        const target = getExpandedWindowSize();
         await window.setAlwaysOnTop(false);
-        await window.setSize(new LogicalSize(NORMAL_WIDTH, NORMAL_HEIGHT));
+        await window.setResizable(true);
+        await window.setSize(new LogicalSize(target.width, target.height));
       })
       .catch((error) => console.error("Failed to restore window", error));
-  }, []);
+  }, [getExpandedWindowSize]);
 
   const handleCloseWindow = useCallback(async () => {
     if (closeToMiniWidget) {
@@ -184,7 +226,7 @@ export default function VelozVoicePage() {
 
   // Register global hotkeys (disabled while recording a new keybind)
   useHotkey(toggleWidgetCombo, handleToggleVisibility, !isRecording);
-  useHotkey(toggleCaptureCombo, handleToggleCapture, !isRecording);
+  useHotkey(toggleCaptureCombo, handleToggleCapture, !isRecording && !isDefaultCaptureCombo(toggleCaptureCombo));
 
   useEffect(() => {
     const html = document.documentElement;
@@ -226,7 +268,8 @@ export default function VelozVoicePage() {
           setIsActive(false);
         } else if (event.payload === "transcribing") {
           setStatus("transcribing");
-          setIsActive(false);
+          // Keep current active state: during segmented live capture backend can
+          // briefly switch to transcribing and back to recording.
         } else if (event.payload === "loading_model") {
           setStatus("processing"); // Reusing processing state for loading
           setIsActive(false);
@@ -250,6 +293,10 @@ export default function VelozVoicePage() {
       // Listen for hardware info
       unlistenHardware = await listen<any>("hardware-info", (event) => {
         console.log("Hardware Info:", event.payload);
+        const whispercppAvailable = Array.isArray(event.payload?.backends?.available)
+          ? event.payload.backends.available.some((item: any) => item?.id === "whispercpp" && item?.available === true)
+          : false;
+
         if (Array.isArray(event.payload.microphones)) {
           setAvailableMics(event.payload.microphones);
         }
@@ -261,6 +308,34 @@ export default function VelozVoicePage() {
           // Auto-enable GPU if available
           if (event.payload.gpu.available) {
             setGpuEnabled(true);
+          } else if (!whispercppAvailable) {
+            setGpuEnabled(false);
+          }
+        }
+        if (event.payload.backends && Array.isArray(event.payload.backends.available)) {
+          const normalized = event.payload.backends.available
+            .filter((item: any) => item && typeof item.id === "string")
+            .map((item: any) => ({
+              id: item.id as BackendId,
+              available: Boolean(item.available),
+              reason: typeof item.reason === "string" ? item.reason : "",
+            }));
+          if (normalized.length > 0) {
+            setAvailableBackends(normalized);
+          }
+
+          if (typeof event.payload.backends.requested === "string") {
+            const requested = event.payload.backends.requested as BackendId;
+            if (["auto", "faster-whisper", "whispercpp"].includes(requested)) {
+              setBackend(requested);
+            }
+          }
+
+          if (typeof event.payload.backends.active === "string") {
+            const active = event.payload.backends.active as BackendId | "none";
+            if (["auto", "faster-whisper", "whispercpp", "none"].includes(active)) {
+              setActiveBackend(active);
+            }
           }
         }
       });
@@ -351,10 +426,20 @@ export default function VelozVoicePage() {
         const saved = JSON.parse(raw);
         if (typeof saved.microphone === "string") setMicrophone(saved.microphone);
         if (typeof saved.model === "string") setModel(saved.model);
+        if (typeof saved.modelDir === "string") setModelDir(saved.modelDir);
+        if (saved.backend === "auto" || saved.backend === "faster-whisper" || saved.backend === "whispercpp") {
+          setBackend(saved.backend);
+        }
+        if (saved.captureMode === "toggle" || saved.captureMode === "hold") {
+          setCaptureMode(saved.captureMode);
+        }
         if (typeof saved.language === "string") setLanguage(saved.language);
         if (saved.uiLanguage === "es" || saved.uiLanguage === "en") setUiLanguage(saved.uiLanguage);
+        if (saved.expandedViewSize === "compact" || saved.expandedViewSize === "large") setExpandedViewSize(saved.expandedViewSize);
+        if (typeof saved.startWithWindows === "boolean") setStartWithWindows(saved.startWithWindows);
         if (typeof saved.gpuEnabled === "boolean") setGpuEnabled(saved.gpuEnabled);
         if (typeof saved.clipboardMode === "boolean") setClipboardMode(saved.clipboardMode);
+        if (typeof saved.clipboardAutoPaste === "boolean") setClipboardAutoPaste(saved.clipboardAutoPaste);
         if (typeof saved.showResponseTimes === "boolean") setShowResponseTimes(saved.showResponseTimes);
         if (typeof saved.closeToMiniWidget === "boolean") setCloseToMiniWidget(saved.closeToMiniWidget);
         if (saved.toggleWidgetCombo === null || typeof saved.toggleWidgetCombo === "object") setToggleWidgetCombo(saved.toggleWidgetCombo ?? null);
@@ -375,10 +460,16 @@ export default function VelozVoicePage() {
       JSON.stringify({
         microphone,
         model,
+        modelDir,
+        backend,
+        captureMode,
         language,
         uiLanguage,
+        expandedViewSize,
+        startWithWindows,
         gpuEnabled,
         clipboardMode,
+        clipboardAutoPaste,
         showResponseTimes,
         closeToMiniWidget,
         toggleWidgetCombo,
@@ -389,10 +480,16 @@ export default function VelozVoicePage() {
     settingsLoaded,
     microphone,
     model,
+    modelDir,
+    backend,
+    captureMode,
     language,
     uiLanguage,
+    expandedViewSize,
+    startWithWindows,
     gpuEnabled,
     clipboardMode,
+    clipboardAutoPaste,
     showResponseTimes,
     closeToMiniWidget,
     toggleWidgetCombo,
@@ -432,6 +529,8 @@ export default function VelozVoicePage() {
         invoke("set_engine_settings", {
           microphone,
           model,
+          modelDir,
+          backend,
           language,
           gpuEnabled,
         })
@@ -440,15 +539,56 @@ export default function VelozVoicePage() {
         console.error("Failed to update engine settings", error);
         setEngineError(uiLanguage === "es" ? "No se pudo actualizar configuración del motor." : "Could not update engine settings.");
       });
-  }, [settingsLoaded, microphone, model, language, gpuEnabled, uiLanguage]);
+  }, [settingsLoaded, microphone, model, modelDir, backend, language, gpuEnabled, uiLanguage]);
 
   useEffect(() => {
     if (!settingsLoaded) return;
 
     import("@tauri-apps/api/core")
-      .then(({ invoke }) => invoke("toggle_clipboard", { enabled: clipboardMode }))
+      .then(({ invoke }) => invoke("set_capture_mode", { mode: captureMode }))
+      .catch((error) => {
+        console.error("Failed to update capture mode", error);
+        setEngineError(uiLanguage === "es" ? "No se pudo actualizar el modo de captura." : "Could not update capture mode.");
+      });
+  }, [settingsLoaded, captureMode, uiLanguage]);
+
+  useEffect(() => {
+    if (!settingsLoaded) return;
+
+    import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke("set_clipboard_settings", { enabled: clipboardMode, autoPaste: clipboardAutoPaste }))
       .catch((error) => console.error("Failed to sync clipboard mode", error));
-  }, [settingsLoaded, clipboardMode]);
+  }, [settingsLoaded, clipboardMode, clipboardAutoPaste]);
+
+  useEffect(() => {
+    if (!settingsLoaded) return;
+
+    import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke("set_startup_enabled", { enabled: startWithWindows }))
+      .catch((error) => console.error("Failed to sync startup setting", error));
+  }, [settingsLoaded, startWithWindows]);
+
+  useEffect(() => {
+    import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke<boolean>("get_startup_enabled"))
+      .then((enabled) => setStartWithWindows(Boolean(enabled)))
+      .catch((error) => console.error("Failed to read startup setting", error));
+  }, []);
+
+  useEffect(() => {
+    if (showMiniWidget || !isVisible) return;
+
+    Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
+      .then(async ([windowApi, dpiApi]) => {
+        const { getCurrentWindow } = windowApi;
+        const { LogicalSize } = dpiApi;
+        const window = getCurrentWindow();
+        const target = getExpandedWindowSize();
+        await window.setResizable(true);
+        await window.setSize(new LogicalSize(target.width, target.height));
+      })
+      .catch((error) => console.error("Failed to apply expanded view size", error));
+  }, [expandedViewSize, getExpandedWindowSize, isVisible, showMiniWidget]);
 
   const toggleGpu = (enabled: boolean) => {
     setGpuEnabled(enabled);
@@ -457,6 +597,9 @@ export default function VelozVoicePage() {
 
   const toggleClipboard = async (enabled: boolean) => {
     setClipboardMode(enabled);
+    if (!enabled) {
+      setClipboardAutoPaste(false);
+    }
   };
 
   const handleRefreshHardware = useCallback(async () => {
@@ -477,10 +620,16 @@ export default function VelozVoicePage() {
         JSON.stringify({
           microphone,
           model,
+          modelDir,
+          backend,
+          captureMode,
           language,
           uiLanguage,
+          expandedViewSize,
+          startWithWindows,
           gpuEnabled,
           clipboardMode,
+          clipboardAutoPaste,
           showResponseTimes,
           closeToMiniWidget,
           toggleWidgetCombo,
@@ -495,10 +644,16 @@ export default function VelozVoicePage() {
   }, [
     microphone,
     model,
+    modelDir,
+    backend,
+    captureMode,
     language,
     uiLanguage,
+    expandedViewSize,
+    startWithWindows,
     gpuEnabled,
     clipboardMode,
+    clipboardAutoPaste,
     showResponseTimes,
     closeToMiniWidget,
     toggleWidgetCombo,
@@ -652,10 +807,21 @@ export default function VelozVoicePage() {
         onMicrophoneChange={setMicrophone}
         model={model}
         onModelChange={setModel}
+        modelDir={modelDir}
+        onModelDirChange={setModelDir}
+        backend={backend}
+        onBackendChange={setBackend}
+        captureMode={captureMode}
+        onCaptureModeChange={setCaptureMode}
+        activeBackend={activeBackend}
         language={language}
         onLanguageChange={setLanguage}
         uiLanguage={uiLanguage}
         onUiLanguageChange={(value) => setUiLanguage(value as UiLanguage)}
+        expandedViewSize={expandedViewSize}
+        onExpandedViewSizeChange={setExpandedViewSize}
+        startWithWindows={startWithWindows}
+        onStartWithWindowsChange={setStartWithWindows}
         closeToMiniWidget={closeToMiniWidget}
         onCloseToMiniWidgetChange={setCloseToMiniWidget}
         gpuEnabled={gpuEnabled}
@@ -670,8 +836,11 @@ export default function VelozVoicePage() {
         showResponseTimes={showResponseTimes}
         onShowResponseTimesChange={setShowResponseTimes}
         gpuInfo={gpuInfo}
+        availableBackends={availableBackends}
         clipboardMode={clipboardMode}
         onClipboardModeChange={toggleClipboard}
+        clipboardAutoPaste={clipboardAutoPaste}
+        onClipboardAutoPasteChange={setClipboardAutoPaste}
         onRefreshHardware={handleRefreshHardware}
         onSave={handleSaveSettings}
       />

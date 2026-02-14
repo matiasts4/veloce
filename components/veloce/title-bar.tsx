@@ -26,7 +26,7 @@ export function TitleBar({ onOpenSettings, onMinimize, onClose, onDragMouseDown 
         aria-label="Drag area"
       >
         <span className="font-mono text-xs font-medium tracking-widest uppercase text-muted-foreground">
-          VelozVoice
+          Veloce
         </span>
       </div>
 

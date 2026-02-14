@@ -10,7 +10,7 @@ const _jetbrainsMono = JetBrains_Mono({
 })
 
 export const metadata: Metadata = {
-  title: 'VelozVoice - Real-Time Voice Dictation',
+  title: 'Veloce - Real-Time Voice Dictation',
   description:
     'Futuristic real-time voice dictation tool with AI-powered transcription',
 }

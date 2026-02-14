@@ -18,8 +18,8 @@ def create_ico():
     # DIB Header
     dib_header = struct.pack('<IiiHHIIIIII', 40, 1, 2, 1, 32, 0, 4, 0, 0, 0, 0)
     
-    # Pixel (BGRA) - Red
-    pixel = b'\x00\x00\xFF\xFF'
+    # Pixel (BGRA) - Transparent
+    pixel = b'\x00\x00\x00\x00'
     
     with open('src-tauri/icons/icon.ico', 'wb') as f:
         f.write(header + entry + dib_header + pixel)

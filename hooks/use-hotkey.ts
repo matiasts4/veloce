@@ -85,6 +85,7 @@ export function useHotkey(
 
   const handler = useCallback(
     (e: KeyboardEvent) => {
+      if (e.repeat) return;
       if (matchesCombo(e, combo)) {
         e.preventDefault();
         e.stopPropagation();
