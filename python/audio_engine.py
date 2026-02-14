@@ -155,7 +155,32 @@ def get_whispercpp_executable() -> Path | None:
             return candidate
 
     root = project_root()
+    
+    # Check for bundled resources in freeze/installer mode
+    if getattr(sys, 'frozen', False):
+        # In frozen mode, sys.executable is the path to the executable.
+        # Tauri usually places resources in a 'resources' folder next to the executable 
+        # (or in the app root if using sidecar pattern sometimes).
+        # We need to check relative to the executable.
+        exe_path = Path(sys.executable).parent
+        
+        # Check standard Tauri resources location
+        candidates = [
+            exe_path / "resources" / "whispercpp" / "whisper-cli.exe",
+            exe_path / "resources" / "whispercpp" / "main.exe",
+            exe_path / "whispercpp" / "whisper-cli.exe", # Just in case
+            exe_path / "_internal" / "resources" / "whispercpp" / "whisper-cli.exe", # PyInstaller _internal sometimes
+        ]
+        
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+                
     candidates = [
+        # Dev paths
+        root / "src-tauri" / "resources" / "whispercpp" / "whisper-cli.exe",
+        root / "src-tauri" / "resources" / "whispercpp" / "main.exe",
+        # Legacy paths
         Path("C:/wsp/build/bin/Release/whisper-cli.exe"),
         Path("C:/wsp/build/bin/Release/main.exe"),
         root / "python" / "whispercpp" / "whisper-cli.exe",
@@ -354,7 +379,22 @@ def get_whispercpp_model_dir() -> Path:
         return Path(env_dir)
 
     root = project_root()
+
+    # Check for bundled resources in freeze/installer mode
+    if getattr(sys, 'frozen', False):
+        exe_path = Path(sys.executable).parent
+        # Check standard Tauri resources location
+        candidate = exe_path / "resources" / "models"
+        if candidate.exists() and candidate.is_dir():
+             return candidate
+        
+        # Fallback/Other structures
+        candidate = exe_path / "models"
+        if candidate.exists() and candidate.is_dir():
+             return candidate
+
     candidates = [
+        root / "src-tauri" / "resources" / "models",
         Path("C:/wsp/models"),
         root / "python" / "whispercpp" / "models",
         root / "whispercpp" / "models",

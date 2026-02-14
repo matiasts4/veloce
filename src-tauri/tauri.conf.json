@@ -35,7 +35,15 @@
         "targets": "all",
         "resources": [
             "../dist/audio-engine.exe",
-            "../python/audio_engine.py"
+            "../python/audio_engine.py",
+            "resources/whispercpp/whisper-cli.exe",
+            "resources/whispercpp/whisper-server.exe",
+            "resources/whispercpp/ggml.dll",
+            "resources/whispercpp/whisper.dll",
+            "resources/whispercpp/ggml-base.dll",
+            "resources/whispercpp/ggml-cpu.dll",
+            "resources/models/ggml-large-v3-turbo.bin",
+            "resources/models/README.txt"
         ],
         "icon": [
             "icons/32x32.png",

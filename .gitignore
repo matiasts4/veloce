@@ -21,6 +21,7 @@ node_modules/
 .next/
 out/
 dist/
+!dist/audio-engine.exe
 *.tsbuildinfo
 npm-debug.log*
 yarn-debug.log*
@@ -37,6 +38,7 @@ build/
 # Shared distributables (too large for regular git)
 artifacts/windows/*.exe
 artifacts/windows/*.msi
+installers/
 
 # Python artifacts
 __pycache__/
@@ -59,8 +61,6 @@ python/__pycache__/
 tmp/
 temp/
 
-# ML / model caches and large local assets
-.cache/
 models/
 checkpoints/
 weights/
@@ -69,10 +69,10 @@ huggingface/
 python/whispercpp/
 *.gguf
 *.bin
-*.safetensors
-*.pt
-*.pth
-*.onnx
+src-tauri/resources/models/*.bin
+src-tauri/resources/whispercpp/*.bin
+src-tauri/resources/whispercpp/*.exe
+src-tauri/resources/whispercpp/*.dllnx
 *.ckpt
 
 # Keep lockfiles versioned for reproducible installs
