@@ -42,6 +42,14 @@ GRATITUDE_PHRASES = [
     "thanks",
 ]
 
+GRATITUDE_PATTERNS = [
+    (
+        re.compile(rf"^\s*{re.escape(phrase)}[\s\.,;:!\?¡¿-]+", re.IGNORECASE),
+        re.compile(rf"[\s\.,;:!\?¡¿-]+{re.escape(phrase)}\s*$", re.IGNORECASE)
+    )
+    for phrase in GRATITUDE_PHRASES
+]
+
 # Globals
 recording = False
 current_recording_id = 0
@@ -1073,14 +1081,10 @@ def cleanup_transcription_text(text: str, duration_s: float) -> str:
         return ""
 
     words = normalized.split()
-    if len(words) >= 6:
-        for phrase in GRATITUDE_PHRASES:
-            prefix_pattern = re.compile(rf"^\s*{re.escape(phrase)}[\s\.,;:!\?¡¿-]+", re.IGNORECASE)
-            suffix_pattern = re.compile(rf"[\s\.,;:!\?¡¿-]+{re.escape(phrase)}\s*$", re.IGNORECASE)
-
-            if duration_s <= 10.0:
-                normalized = prefix_pattern.sub("", normalized).strip()
-                normalized = suffix_pattern.sub("", normalized).strip()
+    if len(words) >= 6 and duration_s <= 10.0:
+        for prefix_pattern, suffix_pattern in GRATITUDE_PATTERNS:
+            normalized = prefix_pattern.sub("", normalized).strip()
+            normalized = suffix_pattern.sub("", normalized).strip()
 
     return normalized
 
