@@ -51,16 +51,20 @@ selected_model = "large-v3-turbo"
 selected_model_dir = ""
 selected_language = "es"
 gpu_enabled = True
-selected_backend = "auto"
-active_backend = "faster-whisper"
+selected_backend = "whispercpp"
+active_backend = "whispercpp"
 current_stream = None
 model_whisper = None
+loaded_model = ""
+loaded_gpu = None
+loaded_backend_type = ""
 model_lock = threading.Lock()
 download_lock = threading.Lock()
 model_load_lock = threading.Lock()
 whisper_server_lock = threading.Lock()
 whisper_server_process = None
 whisper_server_model_path = ""
+backend_load_lock = threading.Lock()
 pre_roll_chunks = deque(maxlen=max(1, int((RATE * PRE_ROLL_SECONDS) / CHUNK)))
 pre_roll_lock = threading.Lock()
 
@@ -105,6 +109,10 @@ def project_root() -> Path:
 def normalize_backend_name(name: str) -> str:
     normalized = (name or "auto").strip().lower()
     return normalized if normalized in SUPPORTED_BACKENDS else "auto"
+
+
+def get_exe_ext() -> str:
+    return ".exe" if sys.platform.startswith("win") else ""
 
 
 def get_torch_cuda_info() -> dict:
@@ -165,12 +173,26 @@ def get_whispercpp_executable() -> Path | None:
         exe_path = Path(sys.executable).parent
         
         # Check standard Tauri resources location
+        ext = get_exe_ext()
         candidates = [
-            exe_path / "resources" / "whispercpp" / "whisper-cli.exe",
-            exe_path / "resources" / "whispercpp" / "main.exe",
-            exe_path / "whispercpp" / "whisper-cli.exe", # Just in case
-            exe_path / "_internal" / "resources" / "whispercpp" / "whisper-cli.exe", # PyInstaller _internal sometimes
+            exe_path / "resources" / "whispercpp" / f"whisper-cli{ext}",
+            exe_path / "resources" / "whispercpp" / f"main{ext}",
+            exe_path / "whispercpp" / f"whisper-cli{ext}",
+            exe_path / "_internal" / "resources" / "whispercpp" / f"whisper-cli{ext}",
+            # Prod layout: audio-engine.exe is in resources/, whispercpp is in resources/whispercpp/
+            exe_path.parent / "whispercpp" / f"whisper-cli{ext}",
+            exe_path.parent / "whispercpp" / f"main{ext}",
+            # Prod layout (Tauri _up_): audio-engine.exe is in _up_/dist/, resources are in resources/
+            exe_path.parent.parent / "resources" / "whispercpp" / f"whisper-cli{ext}",
+            exe_path.parent.parent / "resources" / "whispercpp" / f"main{ext}",
+            # Dev layout: audio-engine.exe is in dist/, resources are in src-tauri/resources/
+            exe_path.parent / "src-tauri" / "resources" / "whispercpp" / f"whisper-cli{ext}",
+            exe_path.parent / "src-tauri" / "resources" / "whispercpp" / f"main{ext}",
+            # Dev layout (extra parent): handle cases where engine might be nested further
+            exe_path.parent.parent / "src-tauri" / "resources" / "whispercpp" / f"whisper-cli{ext}",
+            exe_path.parent.parent / "src-tauri" / "resources" / "whispercpp" / f"main{ext}",
         ]
+
         
         for candidate in candidates:
             if candidate.exists() and candidate.is_file():
@@ -178,17 +200,17 @@ def get_whispercpp_executable() -> Path | None:
                 
     candidates = [
         # Dev paths
-        root / "src-tauri" / "resources" / "whispercpp" / "whisper-cli.exe",
-        root / "src-tauri" / "resources" / "whispercpp" / "main.exe",
+        root / "src-tauri" / "resources" / "whispercpp" / f"whisper-cli{get_exe_ext()}",
+        root / "src-tauri" / "resources" / "whispercpp" / f"main{get_exe_ext()}",
         # Legacy paths
-        Path("C:/wsp/build/bin/Release/whisper-cli.exe"),
-        Path("C:/wsp/build/bin/Release/main.exe"),
-        root / "python" / "whispercpp" / "whisper-cli.exe",
-        root / "python" / "whispercpp" / "main.exe",
-        root / "python" / "whispercpp" / "build" / "bin" / "Release" / "whisper-cli.exe",
-        root / "python" / "whispercpp" / "build" / "bin" / "Release" / "main.exe",
-        root / "whispercpp" / "build" / "bin" / "Release" / "whisper-cli.exe",
-        root / "whispercpp" / "build" / "bin" / "Release" / "main.exe",
+        Path(f"C:/wsp/build/bin/Release/whisper-cli{get_exe_ext()}"),
+        Path(f"C:/wsp/build/bin/Release/main{get_exe_ext()}"),
+        root / "python" / "whispercpp" / f"whisper-cli{get_exe_ext()}",
+        root / "python" / "whispercpp" / f"main{get_exe_ext()}",
+        root / "python" / "whispercpp" / "build" / "bin" / "Release" / f"whisper-cli{get_exe_ext()}",
+        root / "python" / "whispercpp" / "build" / "bin" / "Release" / f"main{get_exe_ext()}",
+        root / "whispercpp" / "build" / "bin" / "Release" / f"whisper-cli{get_exe_ext()}",
+        root / "whispercpp" / "build" / "bin" / "Release" / f"main{get_exe_ext()}",
     ]
 
     for candidate in candidates:
@@ -207,16 +229,16 @@ def get_whispercpp_server_executable() -> Path | None:
 
     cli_candidate = get_whispercpp_executable()
     if cli_candidate is not None:
-        server_from_cli = cli_candidate.with_name("whisper-server.exe")
+        server_from_cli = cli_candidate.with_name(f"whisper-server{get_exe_ext()}")
         if server_from_cli.exists() and server_from_cli.is_file():
             return server_from_cli
 
     root = project_root()
     candidates = [
-        Path("C:/wsp/build/bin/Release/whisper-server.exe"),
-        root / "python" / "whispercpp" / "whisper-server.exe",
-        root / "python" / "whispercpp" / "build" / "bin" / "Release" / "whisper-server.exe",
-        root / "whispercpp" / "build" / "bin" / "Release" / "whisper-server.exe",
+        Path(f"C:/wsp/build/bin/Release/whisper-server{get_exe_ext()}"),
+        root / "python" / "whispercpp" / f"whisper-server{get_exe_ext()}",
+        root / "python" / "whispercpp" / "build" / "bin" / "Release" / f"whisper-server{get_exe_ext()}",
+        root / "whispercpp" / "build" / "bin" / "Release" / f"whisper-server{get_exe_ext()}",
     ]
 
     for candidate in candidates:
@@ -302,6 +324,58 @@ def stop_whisper_server():
     whisper_server_model_path = ""
 
 
+def _whisper_server_log_listener(process):
+    """Thread to read whisper-server stderr and filter/emit logs."""
+    if not process or not process.stderr:
+        return
+        
+    for line_bytes in process.stderr:
+        try:
+            line = line_bytes.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            
+            # Simple filtering
+            lower_line = line.lower()
+            
+            # Known info/status messages
+            info_patterns = [
+                "whisper_init_state:", 
+                "whisper_init_from_file_with_params_no_state:",
+                "compute buffer",
+                "system_info:",
+                "llama_perf_context_print:",
+                "model_load:",
+                "params.n_threads =",
+            ]
+            
+            is_info = any(p in lower_line for p in info_patterns)
+            
+            # Filter out noisy "processing" logs from whisper-server
+            noisy_patterns = [
+                "operator ():",
+                "processing 'chunk.wav'",
+                "timestamps = 0",
+                "lang ="
+            ]
+            if any(p in lower_line for p in noisy_patterns):
+                continue
+
+            if is_info:
+                # emit({"log": f"whisper-server: {line}"}) # Reduce noise even on info
+                pass
+            elif "error" in lower_line or "fail" in lower_line:
+                emit({"error": f"whisper-server error: {line}"})
+            else:
+                # Default to log to avoid too many "red" popups for non-errors
+                # Only emit if it looks meaningful
+                if len(line) > 5:
+                    emit({"log": f"whisper-server info: {line}"})
+                
+        except Exception:
+            pass
+
+
 def ensure_whisper_server(model_path: str, prefer_gpu: bool) -> tuple[bool, str]:
     global whisper_server_process, whisper_server_model_path
 
@@ -338,18 +412,23 @@ def ensure_whisper_server(model_path: str, prefer_gpu: bool) -> tuple[bool, str]
             "-m",
             model_path,
             "-nt",
-            "-pp",
         ]
         if not prefer_gpu:
             command.append("-ng")
+        
+        # Diagnostic print
+        # print(f"DEBUG: Starting whisper-server with command: {' '.join(command)}")
+        # print(f"DEBUG: Prefer GPU is {prefer_gpu}")
 
         try:
             whisper_server_process = subprocess.Popen(
                 command,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, # Capture to filter
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0,
             )
+            # Start log filter thread
+            threading.Thread(target=_whisper_server_log_listener, args=(whisper_server_process,), daemon=True).start()
         except Exception as e:
             whisper_server_process = None
             return False, f"No se pudo iniciar whisper-server: {e}"
@@ -390,6 +469,25 @@ def get_whispercpp_model_dir() -> Path:
         
         # Fallback/Other structures
         candidate = exe_path / "models"
+        if candidate.exists() and candidate.is_dir():
+             return candidate
+
+        # Prod layout: audio-engine.exe is in resources/, models are in resources/models/
+        candidate = exe_path.parent / "models"
+        if candidate.exists() and candidate.is_dir():
+             return candidate
+
+        # Prod layout (Tauri _up_): audio-engine.exe is in _up_/dist/, models are in resources/models/
+        candidate = exe_path.parent.parent / "resources" / "models"
+        if candidate.exists() and candidate.is_dir():
+             return candidate
+
+        # Dev layout: audio-engine.exe is in dist/, models are in src-tauri/resources/models/
+        candidate = exe_path.parent / "src-tauri" / "resources" / "models"
+        if candidate.exists() and candidate.is_dir():
+             return candidate
+
+        candidate = exe_path.parent.parent / "src-tauri" / "resources" / "models"
         if candidate.exists() and candidate.is_dir():
              return candidate
 
@@ -491,7 +589,7 @@ def get_whispercpp_status(model_name: str) -> dict:
 
     reason = ""
     if executable is None:
-        reason = "No se encontró whisper-cli.exe. Configura WHISPERCPP_EXE o instala whisper.cpp compilado para Windows."
+        reason = f"No se encontró whisper-cli{get_exe_ext()}. Configura WHISPERCPP_EXE o instala whisper.cpp compilado."
     elif model_file is None:
         reason = f"No se encontró modelo ggml/gguf para '{model_name}' en {get_whispercpp_model_dir()}"
     elif resolved_model and resolved_model != model_name:
@@ -687,9 +785,17 @@ def get_hardware_info():
     gpu_name = str(cuda_info["gpu_name"])
     whispercpp_status = get_whispercpp_status(selected_model)
     gpu_reason = ""
+    
+    # Improved GPU reporting for whisper.cpp
     if active_backend == "whispercpp":
+        # whisper.cpp has its own GPU detection (CUDA/Vulkan). 
+        # If available and server is ready/starting with GPU enabled, we consider GPU active even if torch doesn't see it.
         if whispercpp_status.get("available"):
-            gpu_reason = "Backend activo: whisper.cpp (aceleración según build Vulkan/CUDA)."
+            if gpu_enabled:
+                gpu_available = True
+                gpu_reason = "Backend activo: whisper.cpp (Aceleración GPU activa via CUDA/Vulkan)."
+            else:
+                gpu_reason = "Backend activo: whisper.cpp (Aceleración GPU desactivada por configuración)."
         else:
             gpu_reason = f"whisper.cpp no listo: {whispercpp_status.get('reason', '')}"
     elif not gpu_available:
@@ -819,9 +925,27 @@ def load_whisper(model_name, prefer_gpu):
 
 
 def load_backend(model_name, prefer_gpu, backend_name):
-    global active_backend, model_whisper
+    global active_backend, model_whisper, loaded_model, loaded_gpu, loaded_backend_type
+    
+    with backend_load_lock:
+        requested_backend = resolve_backend(model_name, prefer_gpu, backend_name)
+        
+        # Avoid redundant reloads
+        if (loaded_model == model_name and 
+            loaded_gpu == prefer_gpu and 
+            loaded_backend_type == backend_name and 
+            active_backend == requested_backend and 
+            active_backend != "none"):
+            
+            # Additional check for whispercpp server health
+            if active_backend == "whispercpp" and is_whisper_server_ready():
+                 emit({"status": "ready"})
+                 return model_name
+            elif active_backend == "faster-whisper" and model_whisper is not None:
+                 emit({"status": "ready"})
+                 return model_name
 
-    chosen_backend = resolve_backend(model_name, prefer_gpu, backend_name)
+        chosen_backend = requested_backend
 
     if chosen_backend == "whispercpp":
         emit({"status": "loading_model"})
@@ -851,13 +975,20 @@ def load_backend(model_name, prefer_gpu, backend_name):
             return active_model
 
         active_backend = "whispercpp"
+        loaded_model = model_name
+        loaded_gpu = prefer_gpu
+        loaded_backend_type = backend_name
         emit({"status": "ready"})
         emit({"log": f"Model ready: {resolved_model} on whisper.cpp server ({model_path})"})
         return resolved_model
 
     active_backend = "faster-whisper"
     active_model = load_whisper(model_name, prefer_gpu)
-    if not active_model:
+    if active_model:
+        loaded_model = model_name
+        loaded_gpu = prefer_gpu
+        loaded_backend_type = backend_name
+    else:
         active_backend = "none"
     return active_model
 
@@ -1036,6 +1167,7 @@ def main():
                     audio_queue.queue.clear()
             
             else:
+                # Avoid busy loop if queue is empty
                 time.sleep(0.01)
 
         except Exception as e:

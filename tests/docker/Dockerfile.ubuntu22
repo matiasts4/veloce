@@ -1,0 +1,31 @@
+# Dockerfile for Fresh Install Simulation (Ubuntu 22.04)
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_NO_CACHE_DIR=1
+
+# 1. System Dependencies (Simulate user having nothing)
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    git \
+    wget \
+    alsa-utils \
+    libasound2-dev \
+    libportaudio2 \
+    libwebkit2gtk-4.0-dev \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Setup Working DIrectory
+WORKDIR /app
+
+# 3. Copy Project Files (Simulate git clone)
+COPY python/ /app/python/
+COPY scripts/ /app/scripts/
+COPY tests/ /app/tests/
+
+# 4. Run the Cross-Platform Scored Test
+CMD ["python3", "tests/runners/run_local_test.py"]
+

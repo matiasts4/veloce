@@ -72,7 +72,7 @@ python/whispercpp/
 src-tauri/resources/models/*.bin
 src-tauri/resources/whispercpp/*.bin
 src-tauri/resources/whispercpp/*.exe
-src-tauri/resources/whispercpp/*.dllnx
+src-tauri/resources/whispercpp/*.dll
 *.ckpt
 
 # Keep lockfiles versioned for reproducible installs

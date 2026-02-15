@@ -1,0 +1,11 @@
+node_modules
+src-tauri/target
+src-tauri/gen
+dist
+out
+.next
+.git
+.vscode
+.idea
+*.log
+*.lock

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback, useEffect, useRef, type MouseEvent as ReactMouseEvent } from "react";
+import { safeInvoke } from "@/lib/tauri-client";
 import { AnimatePresence, motion } from "framer-motion";
 import { AudioLines, Check, Mic, X } from "lucide-react";
 import { TitleBar } from "@/components/veloce/title-bar";
@@ -122,6 +123,50 @@ export default function VelocePage() {
       setIsVisible(false);
       setShowMiniWidget(true);
 
+      import("@/lib/tauri-client").then(({ isTauri }) => {
+        if (!isTauri()) return;
+
+        Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
+          .then(async ([windowApi, dpiApi]) => {
+            const { getCurrentWindow } = windowApi;
+            const { LogicalSize } = dpiApi;
+            const window = getCurrentWindow();
+            await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
+            await window.setResizable(false);
+            await window.setAlwaysOnTop(true);
+          })
+          .catch((error) => console.error("Failed to minimize from hotkey", error));
+      });
+      return;
+    }
+
+    setIsVisible(true);
+    setShowMiniWidget(false);
+
+    import("@/lib/tauri-client").then(({ isTauri }) => {
+      if (!isTauri()) return;
+
+      Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
+        .then(async ([windowApi, dpiApi]) => {
+          const { getCurrentWindow } = windowApi;
+          const { LogicalSize } = dpiApi;
+          const window = getCurrentWindow();
+          const target = getExpandedWindowSize();
+          await window.setAlwaysOnTop(false);
+          await window.setResizable(true);
+          await window.setSize(new LogicalSize(target.width, target.height));
+        })
+        .catch((error) => console.error("Failed to restore from hotkey", error));
+    });
+  }, [getExpandedWindowSize, isVisible]);
+
+  const handleMinimizeToMiniWidget = useCallback(() => {
+    setIsVisible(false);
+    setShowMiniWidget(true);
+
+    import("@/lib/tauri-client").then(({ isTauri }) => {
+      if (!isTauri()) return;
+
       Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
         .then(async ([windowApi, dpiApi]) => {
           const { getCurrentWindow } = windowApi;
@@ -131,57 +176,29 @@ export default function VelocePage() {
           await window.setResizable(false);
           await window.setAlwaysOnTop(true);
         })
-        .catch((error) => console.error("Failed to minimize from hotkey", error));
-      return;
-    }
-
-    setIsVisible(true);
-    setShowMiniWidget(false);
-
-    Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
-      .then(async ([windowApi, dpiApi]) => {
-        const { getCurrentWindow } = windowApi;
-        const { LogicalSize } = dpiApi;
-        const window = getCurrentWindow();
-        const target = getExpandedWindowSize();
-        await window.setAlwaysOnTop(false);
-        await window.setResizable(true);
-        await window.setSize(new LogicalSize(target.width, target.height));
-      })
-      .catch((error) => console.error("Failed to restore from hotkey", error));
-  }, [getExpandedWindowSize, isVisible]);
-
-  const handleMinimizeToMiniWidget = useCallback(() => {
-    setIsVisible(false);
-    setShowMiniWidget(true);
-
-    Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
-      .then(async ([windowApi, dpiApi]) => {
-        const { getCurrentWindow } = windowApi;
-        const { LogicalSize } = dpiApi;
-        const window = getCurrentWindow();
-        await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
-        await window.setResizable(false);
-        await window.setAlwaysOnTop(true);
-      })
-      .catch((error) => console.error("Failed to minimize to mini widget", error));
+        .catch((error) => console.error("Failed to minimize to mini widget", error));
+    });
   }, []);
 
   const handleRestoreFromMiniWidget = useCallback(() => {
     setIsVisible(true);
     setShowMiniWidget(false);
 
-    Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
-      .then(async ([windowApi, dpiApi]) => {
-        const { getCurrentWindow } = windowApi;
-        const { LogicalSize } = dpiApi;
-        const window = getCurrentWindow();
-        const target = getExpandedWindowSize();
-        await window.setAlwaysOnTop(false);
-        await window.setResizable(true);
-        await window.setSize(new LogicalSize(target.width, target.height));
-      })
-      .catch((error) => console.error("Failed to restore window", error));
+    import("@/lib/tauri-client").then(({ isTauri }) => {
+      if (!isTauri()) return;
+
+      Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
+        .then(async ([windowApi, dpiApi]) => {
+          const { getCurrentWindow } = windowApi;
+          const { LogicalSize } = dpiApi;
+          const window = getCurrentWindow();
+          const target = getExpandedWindowSize();
+          await window.setAlwaysOnTop(false);
+          await window.setResizable(true);
+          await window.setSize(new LogicalSize(target.width, target.height));
+        })
+        .catch((error) => console.error("Failed to restore window", error));
+    });
   }, [getExpandedWindowSize]);
 
   const handleCloseWindow = useCallback(async () => {
@@ -190,12 +207,15 @@ export default function VelocePage() {
       return;
     }
 
-    try {
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      await getCurrentWindow().close();
-    } catch (error) {
-      console.error("Failed to close window", error);
-    }
+    import("@/lib/tauri-client").then(async ({ isTauri }) => {
+      if (!isTauri()) return;
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        await getCurrentWindow().close();
+      } catch (error) {
+        console.error("Failed to close window", error);
+      }
+    });
   }, [closeToMiniWidget, handleMinimizeToMiniWidget]);
 
   const handleStartWindowDrag = useCallback(async (event: ReactMouseEvent<HTMLElement>) => {
@@ -204,26 +224,31 @@ export default function VelocePage() {
       return;
     }
 
-    try {
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      await getCurrentWindow().startDragging();
-    } catch (error) {
-      console.error("Failed to start dragging", error);
-    }
+    import("@/lib/tauri-client").then(async ({ isTauri }) => {
+      if (!isTauri()) return;
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        await getCurrentWindow().startDragging();
+      } catch (error) {
+        console.error("Failed to start dragging", error);
+      }
+    });
   }, []);
 
   // Toggle capture
   const handleToggleCapture = useCallback(async () => {
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      const recording = await invoke<boolean>("toggle_recording");
-      if (recording) {
+      const recording = await safeInvoke<boolean>("toggle_recording");
+      if (typeof recording === "boolean" && recording) {
         activeRecordingIdRef.current = null;
         setLatestTranscript("");
         setLastResponseMs(null);
+        setIsActive(recording);
+        setStatus("listening");
+      } else if (typeof recording === "boolean") {
+        setIsActive(recording);
+        setStatus("idle");
       }
-      setIsActive(recording);
-      setStatus(recording ? "listening" : "idle");
     } catch (error) {
       console.error("Failed to toggle recording", error);
       setEngineError(uiLanguage === "es" ? "No se pudo iniciar/detener la grabación." : "Could not start/stop recording.");
@@ -265,231 +290,236 @@ export default function VelocePage() {
     let unlistenLog: () => void;
     let unlistenModelDownload: () => void;
 
-    import("@tauri-apps/api/event").then(async ({ listen }) => {
-      unlistenStatus = await listen<string>("status-update", (event) => {
-        console.log("Status update:", event.payload);
-        // Map backend status to UI status
-        // Backend: "recording", "stopped", "loading_model", "ready"
-        if (event.payload === "recording") {
-          setStatus("listening");
-          setIsActive(true);
-        } else if (event.payload === "stopped") {
-          setStatus("idle");
-          setIsActive(false);
-        } else if (event.payload === "transcribing") {
-          setStatus("transcribing");
-          // Keep current active state: during segmented live capture backend can
-          // briefly switch to transcribing and back to recording.
-        } else if (event.payload === "loading_model") {
-          setStatus("processing"); // Reusing processing state for loading
-          setIsActive(false);
-        } else if (event.payload === "ready") {
-          setStatus("idle");
-          setIsActive(false);
-        }
-      });
+    import("@/lib/tauri-client").then(({ isTauri }) => {
+      if (!isTauri()) return;
 
-      unlistenRecording = await listen<boolean>("recording-state", (event) => {
-        const isRecording = event.payload;
-        if (isRecording) {
-          activeRecordingIdRef.current = null;
-          setLatestTranscript("");
-          setLastResponseMs(null);
-        }
-        setIsActive(isRecording);
-        setStatus(isRecording ? "listening" : "idle");
-      });
+      import("@tauri-apps/api/event").then(async ({ listen }) => {
+        unlistenStatus = await listen<string>("status-update", (event) => {
+          console.log("Status update:", event.payload);
+          // Map backend status to UI status
+          // Backend: "recording", "stopped", "loading_model", "ready"
+          if (event.payload === "recording") {
+            setStatus("listening");
+            setIsActive(true);
+          } else if (event.payload === "stopped") {
+            setStatus("idle");
+            setIsActive(false);
+          } else if (event.payload === "transcribing") {
+            setStatus("transcribing");
+            // Keep current active state: during segmented live capture backend can
+            // briefly switch to transcribing and back to recording.
+          } else if (event.payload === "loading_model") {
+            setStatus("processing"); // Reusing processing state for loading
+            setIsActive(false);
+          } else if (event.payload === "ready") {
+            setStatus("idle");
+            setIsActive(false);
+          }
+        });
 
-      // Listen for hardware info
-      unlistenHardware = await listen<any>("hardware-info", (event) => {
-        console.log("Hardware Info:", event.payload);
-        const whispercppAvailable = Array.isArray(event.payload?.backends?.available)
-          ? event.payload.backends.available.some((item: any) => item?.id === "whispercpp" && item?.available === true)
-          : false;
+        unlistenRecording = await listen<boolean>("recording-state", (event) => {
+          const isRecording = event.payload;
+          if (isRecording) {
+            activeRecordingIdRef.current = null;
+            setLatestTranscript("");
+            setLastResponseMs(null);
+          }
+          setIsActive(isRecording);
+          setStatus(isRecording ? "listening" : "idle");
+        });
 
-        if (Array.isArray(event.payload.microphones)) {
-          setAvailableMics(event.payload.microphones);
-        }
-        if (Array.isArray(event.payload.models)) {
-          setDownloadedModels(event.payload.models);
-          setModelDownloads((previous) => {
-            let hasChanges = false;
-            const next = { ...previous };
-            for (const item of event.payload.models) {
-              if (!item || typeof item.id !== "string") continue;
-              if (item.downloaded === true) {
-                const current = next[item.id];
-                if (!current || current.status !== "completed" || current.progress !== 100) {
-                  next[item.id] = { status: "completed", progress: 100 };
-                  hasChanges = true;
+        // Listen for hardware info
+        unlistenHardware = await listen<any>("hardware-info", (event) => {
+          console.log("Hardware Info:", event.payload);
+          const whispercppAvailable = Array.isArray(event.payload?.backends?.available)
+            ? event.payload.backends.available.some((item: any) => item?.id === "whispercpp" && item?.available === true)
+            : false;
+
+          if (Array.isArray(event.payload.microphones)) {
+            setAvailableMics(event.payload.microphones);
+          }
+          if (Array.isArray(event.payload.models)) {
+            setDownloadedModels(event.payload.models);
+            setModelDownloads((previous) => {
+              let hasChanges = false;
+              const next = { ...previous };
+              for (const item of event.payload.models) {
+                if (!item || typeof item.id !== "string") continue;
+                if (item.downloaded === true) {
+                  const current = next[item.id];
+                  if (!current || current.status !== "completed" || current.progress !== 100) {
+                    next[item.id] = { status: "completed", progress: 100 };
+                    hasChanges = true;
+                  }
                 }
               }
-            }
-            return hasChanges ? next : previous;
-          });
-          const currentActiveDownload = activeModelDownloadRef.current;
-          if (currentActiveDownload) {
-            const done = event.payload.models.some((item: { id?: string; downloaded?: boolean }) => item.id === currentActiveDownload && item.downloaded === true);
-            if (done) {
-              setActiveModelDownload(null);
-            }
-          }
-        }
-        if (Array.isArray(event.payload.model_dirs)) {
-          const options = event.payload.model_dirs
-            .filter((item: unknown) => typeof item === "string")
-            .map((item: string) => item.trim())
-            .filter((item: string) => item.length > 0);
-          setModelDirOptions(options);
-
-          if (!modelDir && typeof event.payload.default_model_dir === "string") {
-            const fallbackDir = event.payload.default_model_dir.trim();
-            if (fallbackDir.length > 0 && options.includes(fallbackDir)) {
-              setModelDir(fallbackDir);
+              return hasChanges ? next : previous;
+            });
+            const currentActiveDownload = activeModelDownloadRef.current;
+            if (currentActiveDownload) {
+              const done = event.payload.models.some((item: { id?: string; downloaded?: boolean }) => item.id === currentActiveDownload && item.downloaded === true);
+              if (done) {
+                setActiveModelDownload(null);
+              }
             }
           }
-        }
-        if (event.payload.gpu) {
-          setGpuInfo(event.payload.gpu);
-          // Auto-enable GPU if available
-          if (event.payload.gpu.available) {
-            setGpuEnabled(true);
-          } else if (!whispercppAvailable) {
-            setGpuEnabled(false);
-          }
-        }
-        if (event.payload.backends && Array.isArray(event.payload.backends.available)) {
-          const normalized = event.payload.backends.available
-            .filter((item: any) => item && typeof item.id === "string")
-            .map((item: any) => ({
-              id: item.id as BackendId,
-              available: Boolean(item.available),
-              reason: typeof item.reason === "string" ? item.reason : "",
-            }));
-          if (normalized.length > 0) {
-            setAvailableBackends(normalized);
-          }
+          if (Array.isArray(event.payload.model_dirs)) {
+            const options = event.payload.model_dirs
+              .filter((item: unknown) => typeof item === "string")
+              .map((item: string) => item.trim())
+              .filter((item: string) => item.length > 0);
+            setModelDirOptions(options);
 
-          if (typeof event.payload.backends.requested === "string") {
-            const requested = event.payload.backends.requested as BackendId;
-            if (["auto", "faster-whisper", "whispercpp"].includes(requested)) {
-              setBackend(requested);
+            if (!modelDir && typeof event.payload.default_model_dir === "string") {
+              const fallbackDir = event.payload.default_model_dir.trim();
+              if (fallbackDir.length > 0 && options.includes(fallbackDir)) {
+                setModelDir(fallbackDir);
+              }
             }
           }
-
-          if (typeof event.payload.backends.active === "string") {
-            const active = event.payload.backends.active as BackendId | "none";
-            if (["auto", "faster-whisper", "whispercpp", "none"].includes(active)) {
-              setActiveBackend(active);
+          if (event.payload.gpu) {
+            setGpuInfo(event.payload.gpu);
+            // Auto-enable GPU if available
+            if (event.payload.gpu.available) {
+              setGpuEnabled(true);
+            } else if (!whispercppAvailable) {
+              setGpuEnabled(false);
             }
           }
-        }
-      });
+          if (event.payload.backends && Array.isArray(event.payload.backends.available)) {
+            const normalized = event.payload.backends.available
+              .filter((item: any) => item && typeof item.id === "string")
+              .map((item: any) => ({
+                id: item.id as BackendId,
+                available: Boolean(item.available),
+                reason: typeof item.reason === "string" ? item.reason : "",
+              }));
+            if (normalized.length > 0) {
+              setAvailableBackends(normalized);
+            }
 
-      unlistenTranscription = await listen<{ text?: string; response_ms?: number; recording_id?: number } | string>("transcription-update", (event) => {
-        const payload = event.payload;
-        const text = typeof payload === "string" ? payload : (payload?.text ?? "");
-        const responseMs = typeof payload === "string" ? null : payload?.response_ms;
-        const recordingId = typeof payload === "string" ? null : (typeof payload?.recording_id === "number" ? payload.recording_id : null);
+            if (typeof event.payload.backends.requested === "string") {
+              const requested = event.payload.backends.requested as BackendId;
+              if (["auto", "faster-whisper", "whispercpp"].includes(requested)) {
+                setBackend(requested);
+              }
+            }
 
-        setLatestTranscript((previous) => {
-          const chunk = text.trim();
-          if (!chunk) {
-            return previous;
+            if (typeof event.payload.backends.active === "string") {
+              const active = event.payload.backends.active as BackendId | "none";
+              if (["auto", "faster-whisper", "whispercpp", "none"].includes(active)) {
+                setActiveBackend(active);
+              }
+            }
           }
+        });
 
-          if (recordingId !== null) {
-            if (activeRecordingIdRef.current === null || activeRecordingIdRef.current !== recordingId) {
-              activeRecordingIdRef.current = recordingId;
+        unlistenTranscription = await listen<{ text?: string; response_ms?: number; recording_id?: number } | string>("transcription-update", (event) => {
+          const payload = event.payload;
+          const text = typeof payload === "string" ? payload : (payload?.text ?? "");
+          const responseMs = typeof payload === "string" ? null : payload?.response_ms;
+          const recordingId = typeof payload === "string" ? null : (typeof payload?.recording_id === "number" ? payload.recording_id : null);
+
+          setLatestTranscript((previous) => {
+            const chunk = text.trim();
+            if (!chunk) {
+              return previous;
+            }
+
+            if (recordingId !== null) {
+              if (activeRecordingIdRef.current === null || activeRecordingIdRef.current !== recordingId) {
+                activeRecordingIdRef.current = recordingId;
+                return chunk;
+              }
+            }
+
+            const current = previous.trim();
+            if (!current) {
               return chunk;
             }
-          }
 
-          const current = previous.trim();
-          if (!current) {
-            return chunk;
-          }
-
-          if (chunk.startsWith(current)) {
-            return chunk;
-          }
-
-          if (current.endsWith(chunk)) {
-            return current;
-          }
-
-          const currentLower = current.toLowerCase();
-          const chunkLower = chunk.toLowerCase();
-          const maxOverlap = Math.min(currentLower.length, chunkLower.length);
-          let overlap = 0;
-          for (let size = maxOverlap; size > 0; size -= 1) {
-            if (currentLower.endsWith(chunkLower.slice(0, size))) {
-              overlap = size;
-              break;
+            if (chunk.startsWith(current)) {
+              return chunk;
             }
-          }
 
-          if (overlap > 0) {
-            return `${current}${chunk.slice(overlap)}`.trim();
-          }
+            if (current.endsWith(chunk)) {
+              return current;
+            }
 
-          return `${current} ${chunk}`;
+            const currentLower = current.toLowerCase();
+            const chunkLower = chunk.toLowerCase();
+            const maxOverlap = Math.min(currentLower.length, chunkLower.length);
+            let overlap = 0;
+            for (let size = maxOverlap; size > 0; size -= 1) {
+              if (currentLower.endsWith(chunkLower.slice(0, size))) {
+                overlap = size;
+                break;
+              }
+            }
+
+            if (overlap > 0) {
+              return `${current}${chunk.slice(overlap)}`.trim();
+            }
+
+            return `${current} ${chunk}`;
+          });
+          if (typeof responseMs === "number") {
+            setLastResponseMs(Math.max(0, Math.round(responseMs)));
+          }
+          setShowMiniDoneTick(true);
+          window.setTimeout(() => setShowMiniDoneTick(false), 1200);
+          setEngineError("");
         });
-        if (typeof responseMs === "number") {
-          setLastResponseMs(Math.max(0, Math.round(responseMs)));
-        }
-        setShowMiniDoneTick(true);
-        window.setTimeout(() => setShowMiniDoneTick(false), 1200);
-        setEngineError("");
-      });
 
-      unlistenError = await listen<string>("engine-error", (event) => {
-        const message = event.payload ?? "";
-        if (message.includes("Model download failed (")) {
-          const modelMatch = message.match(/Model download failed \(([^)]+)\):/);
-          const failedModel = modelMatch?.[1] ?? activeModelDownloadRef.current;
-          if (failedModel) {
+        unlistenError = await listen<string>("engine-error", (event) => {
+          const message = event.payload ?? "";
+          if (message.includes("Model download failed (")) {
+            const modelMatch = message.match(/Model download failed \(([^)]+)\):/);
+            const failedModel = modelMatch?.[1] ?? activeModelDownloadRef.current;
+            if (failedModel) {
+              setModelDownloads((previous) => ({
+                ...previous,
+                [failedModel]: { status: "error", progress: 0 },
+              }));
+            }
+            setActiveModelDownload(null);
+          } else if (message.includes("Another model download is already in progress") && activeModelDownloadRef.current) {
             setModelDownloads((previous) => ({
               ...previous,
-              [failedModel]: { status: "error", progress: 0 },
+              [activeModelDownloadRef.current as string]: { status: "error", progress: 0 },
             }));
+            setActiveModelDownload(null);
           }
-          setActiveModelDownload(null);
-        } else if (message.includes("Another model download is already in progress") && activeModelDownloadRef.current) {
+          setEngineError(event.payload);
+        });
+
+        unlistenLog = await listen<string>("engine-log", (event) => {
+          setEngineLog(event.payload);
+        });
+
+        unlistenModelDownload = await listen<{ model?: string; progress?: number }>("model-download-progress", (event) => {
+          const modelId = typeof event.payload?.model === "string" ? event.payload.model : "";
+          if (!modelId) return;
+
+          const progress = Math.max(0, Math.min(100, Number(event.payload?.progress ?? 0)));
           setModelDownloads((previous) => ({
             ...previous,
-            [activeModelDownloadRef.current as string]: { status: "error", progress: 0 },
+            [modelId]: {
+              status: progress >= 100 ? "completed" : "downloading",
+              progress,
+            },
           }));
-          setActiveModelDownload(null);
-        }
-        setEngineError(event.payload);
-      });
 
-      unlistenLog = await listen<string>("engine-log", (event) => {
-        setEngineLog(event.payload);
-      });
+          if (progress >= 100) {
+            setActiveModelDownload(null);
+          }
+        });
 
-      unlistenModelDownload = await listen<{ model?: string; progress?: number }>("model-download-progress", (event) => {
-        const modelId = typeof event.payload?.model === "string" ? event.payload.model : "";
-        if (!modelId) return;
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("refresh_hardware");
+      }); // Close import event
 
-        const progress = Math.max(0, Math.min(100, Number(event.payload?.progress ?? 0)));
-        setModelDownloads((previous) => ({
-          ...previous,
-          [modelId]: {
-            status: progress >= 100 ? "completed" : "downloading",
-            progress,
-          },
-        }));
-
-        if (progress >= 100) {
-          setActiveModelDownload(null);
-        }
-      });
-
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("refresh_hardware");
-    });
+    }); // Close isTauri check
 
     return () => {
       if (unlistenStatus) unlistenStatus();
@@ -593,8 +623,7 @@ export default function VelocePage() {
   useEffect(() => {
     if (!settingsOpen) return;
 
-    import("@tauri-apps/api/core")
-      .then(({ invoke }) => invoke("refresh_hardware"))
+    safeInvoke("refresh_hardware")
       .catch((error) => console.error("Failed to refresh hardware", error));
   }, [settingsOpen]);
 
@@ -641,17 +670,14 @@ export default function VelocePage() {
   useEffect(() => {
     if (!settingsLoaded) return;
 
-    import("@tauri-apps/api/core")
-      .then(({ invoke }) =>
-        invoke("set_engine_settings", {
-          microphone,
-          model,
-          modelDir,
-          backend,
-          language,
-          gpuEnabled,
-        })
-      )
+    safeInvoke("set_engine_settings", {
+      microphone,
+      model,
+      modelDir,
+      backend,
+      language,
+      gpuEnabled,
+    })
       .catch((error) => {
         console.error("Failed to update engine settings", error);
         setEngineError(uiLanguage === "es" ? "No se pudo actualizar configuración del motor." : "Could not update engine settings.");
@@ -661,8 +687,7 @@ export default function VelocePage() {
   useEffect(() => {
     if (!settingsLoaded) return;
 
-    import("@tauri-apps/api/core")
-      .then(({ invoke }) => invoke("set_capture_mode", { mode: captureMode }))
+    safeInvoke("set_capture_mode", { mode: captureMode })
       .catch((error) => {
         console.error("Failed to update capture mode", error);
         setEngineError(uiLanguage === "es" ? "No se pudo actualizar el modo de captura." : "Could not update capture mode.");
@@ -672,8 +697,7 @@ export default function VelocePage() {
   useEffect(() => {
     if (!settingsLoaded || !toggleCaptureCombo) return;
 
-    import("@tauri-apps/api/core")
-      .then(({ invoke }) => invoke("set_capture_hotkey", { hotkey: toggleCaptureCombo }))
+    safeInvoke("set_capture_hotkey", { hotkey: toggleCaptureCombo })
       .catch((error) => {
         console.error("Failed to update capture hotkey", error);
         setEngineError(uiLanguage === "es" ? "No se pudo actualizar el atajo global de captura." : "Could not update global capture hotkey.");
@@ -688,22 +712,19 @@ export default function VelocePage() {
   useEffect(() => {
     if (!settingsLoaded) return;
 
-    import("@tauri-apps/api/core")
-      .then(({ invoke }) => invoke("set_clipboard_settings", { enabled: clipboardMode, autoPaste: clipboardAutoPaste }))
+    safeInvoke("set_clipboard_settings", { enabled: clipboardMode, autoPaste: clipboardAutoPaste })
       .catch((error) => console.error("Failed to sync clipboard mode", error));
   }, [settingsLoaded, clipboardMode, clipboardAutoPaste]);
 
   useEffect(() => {
     if (!settingsLoaded) return;
 
-    import("@tauri-apps/api/core")
-      .then(({ invoke }) => invoke("set_startup_enabled", { enabled: startWithWindows }))
+    safeInvoke("set_startup_enabled", { enabled: startWithWindows })
       .catch((error) => console.error("Failed to sync startup setting", error));
   }, [settingsLoaded, startWithWindows]);
 
   useEffect(() => {
-    import("@tauri-apps/api/core")
-      .then(({ invoke }) => invoke<boolean>("get_startup_enabled"))
+    safeInvoke<boolean>("get_startup_enabled")
       .then((enabled) => setStartWithWindows(Boolean(enabled)))
       .catch((error) => console.error("Failed to read startup setting", error));
   }, []);
@@ -711,16 +732,20 @@ export default function VelocePage() {
   useEffect(() => {
     if (showMiniWidget || !isVisible) return;
 
-    Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
-      .then(async ([windowApi, dpiApi]) => {
-        const { getCurrentWindow } = windowApi;
-        const { LogicalSize } = dpiApi;
-        const window = getCurrentWindow();
-        const target = getExpandedWindowSize();
-        await window.setResizable(true);
-        await window.setSize(new LogicalSize(target.width, target.height));
-      })
-      .catch((error) => console.error("Failed to apply expanded view size", error));
+    import("@/lib/tauri-client").then(({ isTauri }) => {
+      if (!isTauri()) return;
+
+      Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
+        .then(async ([windowApi, dpiApi]) => {
+          const { getCurrentWindow } = windowApi;
+          const { LogicalSize } = dpiApi;
+          const window = getCurrentWindow();
+          const target = getExpandedWindowSize();
+          await window.setResizable(true);
+          await window.setSize(new LogicalSize(target.width, target.height));
+        })
+        .catch((error) => console.error("Failed to apply expanded view size", error));
+    });
   }, [expandedViewSize, getExpandedWindowSize, isVisible, showMiniWidget]);
 
   const toggleGpu = (enabled: boolean) => {
@@ -737,8 +762,7 @@ export default function VelocePage() {
 
   const handleRefreshHardware = useCallback(async () => {
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("refresh_hardware");
+      await safeInvoke("refresh_hardware");
       setEngineLog(uiLanguage === "es" ? "Hardware actualizado" : "Hardware refreshed");
     } catch (error) {
       console.error("Failed to refresh hardware", error);
@@ -749,14 +773,13 @@ export default function VelocePage() {
   const handleDownloadModel = useCallback(
     async (modelId: string) => {
       try {
-        const { invoke } = await import("@tauri-apps/api/core");
         setEngineError("");
         setActiveModelDownload(modelId);
         setModelDownloads((previous) => ({
           ...previous,
           [modelId]: { status: "starting", progress: 0 },
         }));
-        await invoke("download_model", { model: modelId });
+        await safeInvoke("download_model", { model: modelId });
       } catch (error) {
         console.error("Failed to start model download", error);
         setModelDownloads((previous) => ({

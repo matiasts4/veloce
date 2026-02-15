@@ -9,6 +9,7 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@/components/ui/dialog";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   Select,
   SelectContent,
@@ -269,6 +270,57 @@ export function SettingsModal({
     return t.downloadAction;
   };
 
+  const handleBrowseModelDir = async () => {
+    const { isTauri } = await import("@/lib/tauri-client");
+    if (!isTauri()) {
+      console.warn("File picker not available in browser mode");
+      return;
+    }
+
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath: modelDir || undefined,
+      });
+
+      if (selected && typeof selected === "string") {
+        onModelDirChange(selected);
+      }
+    } catch (error) {
+      console.error("Failed to open directory picker", error);
+    }
+  };
+
+  const handleBrowseModelFile = async () => {
+    const { isTauri } = await import("@/lib/tauri-client");
+    if (!isTauri()) {
+      console.warn("File picker not available in browser mode");
+      return;
+    }
+
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        filters: [{
+          name: "Whisper Models",
+          extensions: ["bin", "gguf"]
+        }]
+      });
+
+      if (selected && typeof selected === "string") {
+        // If we pick a specific file, we might want to set the model to that file path
+        // or handle it in a way the backend understands.
+        // For now, let's assume the backend can handle absolute paths in the 'model' field
+        // OR we just treat it as adding a model to the list.
+        // Let's set the model directly.
+        onModelChange(selected);
+      }
+    } catch (error) {
+      console.error("Failed to open file picker", error);
+    }
+  };
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="w-[96vw] max-w-[32rem] max-h-[calc(100vh-1.25rem)] overflow-y-auto overflow-x-hidden rounded-2xl border-border bg-card p-4 [scrollbar-width:thin] [scrollbar-color:hsl(var(--border))_transparent] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border/70 [&::-webkit-scrollbar-thumb:hover]:bg-border [&_*]:min-w-0">
@@ -426,14 +478,22 @@ export function SettingsModal({
                 {downloadedOnly.length > 0 ? downloadedOnly.map((m) => (
                   <SelectItem key={m.id} value={m.id}>
                     {"✓ " + normalizeModelLabel(m.name)}
+                    {"✓ " + normalizeModelLabel(m.name)}
                   </SelectItem>
-                )) : (
-                  <SelectItem value="__none__" disabled>
-                    {uiLanguage === "es" ? "No hay modelos detectados" : "No detected models"}
-                  </SelectItem>
+                )) : null}
+                <SelectItem value="__custom_file__">{uiLanguage === "es" ? "Seleccionar archivo..." : "Select file..."}</SelectItem>
+                {model && !downloadedOnly.find(m => m.id === model) && model !== "__custom_file__" && (
+                  <SelectItem value={model}>{model}</SelectItem>
                 )}
               </SelectContent>
             </Select>
+            {model === "__custom_file__" && (
+              <div className="mt-2">
+                <Button type="button" variant="secondary" size="sm" onClick={handleBrowseModelFile} className="w-full">
+                  {uiLanguage === "es" ? "Explorar..." : "Browse..."}
+                </Button>
+              </div>
+            )}
             <p className="text-[11px] text-muted-foreground">
               {"✓ " + t.downloadedModel + " · " + t.modelHint}
             </p>
@@ -557,6 +617,15 @@ export function SettingsModal({
                 ))}
               </SelectContent>
             </Select>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={handleBrowseModelDir}
+              className="mt-1 w-full"
+            >
+              {uiLanguage === "es" ? "Explorar carpeta..." : "Browse folder..."}
+            </Button>
             <p className="text-[11px] text-muted-foreground">{t.modelDirHint}</p>
           </div>
 

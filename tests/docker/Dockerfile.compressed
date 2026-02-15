@@ -1,0 +1,36 @@
+# Dockerfile for Compressed Package Install (Debian Bookworm)
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_NO_CACHE_DIR=1
+
+# 1. Minimal System Dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    libasound2 \
+    libportaudio2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 2. Simulate "Extracting" a tar.gz
+# In a real scenario we would COPY a .tar.gz and extract, here we COPY the folder structure
+COPY python/ /app/veloce_pkg/python/
+COPY scripts/ /app/veloce_pkg/scripts/
+COPY tests/ /app/veloce_pkg/tests/
+
+
+WORKDIR /app/veloce_pkg
+
+# 3. Create Venv and Install
+RUN python3 -m venv venv
+ENV PATH="/app/veloce_pkg/venv/bin:$PATH"
+
+# 4. Install using fast_install logic (manually triggering pip here as baseline)
+RUN pip install --no-cache-dir -r python/requirements.txt
+
+# 5. Verification
+CMD ["python3", "tests/runners/run_local_test.py"]
+

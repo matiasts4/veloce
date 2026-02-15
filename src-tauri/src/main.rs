@@ -50,9 +50,12 @@ struct HotkeyConfig {
 }
 
 fn key_to_code(key: &str) -> Option<Code> {
+    // Check for literal space BEFORE trimming (trim would erase it)
+    if key == " " || key.trim().eq_ignore_ascii_case("space") {
+        return Some(Code::Space);
+    }
     let normalized = key.trim().to_lowercase();
     match normalized.as_str() {
-        " " | "space" => Some(Code::Space),
         "home" => Some(Code::Home),
         "end" => Some(Code::End),
         "insert" => Some(Code::Insert),
@@ -256,6 +259,11 @@ fn resolve_audio_engine_executable<R: Runtime>(app: &AppHandle<R>) -> Option<Pat
         executable_candidates.push(current_dir.join("dist/audio-engine.exe"));
         executable_candidates.push(current_dir.join("audio-engine.exe"));
         executable_candidates.push(current_dir.join("../dist/audio-engine.exe"));
+        
+        // Linux/Unix candidates
+        executable_candidates.push(current_dir.join("dist/audio-engine"));
+        executable_candidates.push(current_dir.join("audio-engine"));
+        executable_candidates.push(current_dir.join("../dist/audio-engine"));
     }
 
     if let Ok(executable) = std::env::current_exe() {
@@ -266,6 +274,14 @@ fn resolve_audio_engine_executable<R: Runtime>(app: &AppHandle<R>) -> Option<Pat
             executable_candidates.push(exe_dir.join("_up_/dist/audio-engine.exe"));
             executable_candidates.push(exe_dir.join("resources/audio-engine.exe"));
             executable_candidates.push(exe_dir.join("resources/dist/audio-engine.exe"));
+
+            // Linux/Unix candidates
+            executable_candidates.push(exe_dir.join("audio-engine"));
+            executable_candidates.push(exe_dir.join("dist/audio-engine"));
+            executable_candidates.push(exe_dir.join("_up_/audio-engine"));
+            executable_candidates.push(exe_dir.join("_up_/dist/audio-engine"));
+            executable_candidates.push(exe_dir.join("resources/audio-engine"));
+            executable_candidates.push(exe_dir.join("resources/dist/audio-engine"));
         }
     }
 
@@ -274,6 +290,12 @@ fn resolve_audio_engine_executable<R: Runtime>(app: &AppHandle<R>) -> Option<Pat
         executable_candidates.push(resource_dir.join("dist/audio-engine.exe"));
         executable_candidates.push(resource_dir.join("resources/audio-engine.exe"));
         executable_candidates.push(resource_dir.join("resources/dist/audio-engine.exe"));
+
+        // Linux/Unix candidates
+        executable_candidates.push(resource_dir.join("audio-engine"));
+        executable_candidates.push(resource_dir.join("dist/audio-engine"));
+        executable_candidates.push(resource_dir.join("resources/audio-engine"));
+        executable_candidates.push(resource_dir.join("resources/dist/audio-engine"));
     }
 
     executable_candidates
@@ -379,6 +401,20 @@ fn spawn_audio_engine<R: Runtime>(app_handle: &AppHandle<R>, child_arc: Arc<Mute
                                     let _ = enigo.key(Key::Control, Direction::Press);
                                     let _ = enigo.key(Key::Unicode('v'), Direction::Click);
                                     let _ = enigo.key(Key::Control, Direction::Release);
+                                    
+                                    // Security: Clear clipboard after a delay to prevent sensitive data persistence
+                                    let text_clone = text.clone();
+                                    std::thread::spawn(move || {
+                                        std::thread::sleep(std::time::Duration::from_secs(10));
+                                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                                            // Only clear if the current content matches what we put in (to avoid clearing user's new copy)
+                                            if let Ok(current_text) = cb.get_text() {
+                                                if current_text == text_clone {
+                                                    let _ = cb.clear();
+                                                }
+                                            }
+                                        }
+                                    });
                                 } else if !clipboard_updated {
                                     let _ = app_handle_clone.emit("engine-error", "No se pudo actualizar el portapapeles; se evitó pegar texto anterior.");
                                 }
@@ -482,6 +518,7 @@ struct SidecarMessage {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(handle_shortcut).build())
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {
