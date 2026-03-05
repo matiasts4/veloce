@@ -1,6 +1,7 @@
 "use client";
 
 import { motion, AnimatePresence } from "framer-motion";
+import { useTranslation } from "react-i18next";
 
 type Status = "idle" | "listening" | "processing" | "transcribing";
 type UiLanguage = "es" | "en";
@@ -12,49 +13,32 @@ interface StatusPillProps {
 
 const statusConfig: Record<
   Status,
-  { label: string; dotClass: string; pillClass: string }
+  { dotClass: string; pillClass: string }
 > = {
   idle: {
-    label: "Ready",
     dotClass: "bg-muted-foreground",
     pillClass: "border-border text-muted-foreground",
   },
   listening: {
-    label: "VAD: Listening...",
     dotClass: "bg-primary",
     pillClass: "border-primary/30 text-primary",
   },
   processing: {
-    label: "Processing...",
     dotClass: "bg-amber-400",
     pillClass: "border-amber-400/30 text-amber-400",
   },
   transcribing: {
-    label: "Transcribing...",
     dotClass: "bg-cyan-400",
     pillClass: "border-cyan-400/30 text-cyan-300",
   },
 };
 
 export function StatusPill({ status, uiLanguage = "es" }: StatusPillProps) {
-  const labels: Record<UiLanguage, Record<Status, string>> = {
-    es: {
-      idle: "Listo",
-      listening: "Escuchando...",
-      processing: "Procesando...",
-      transcribing: "Transcribiendo...",
-    },
-    en: {
-      idle: "Ready",
-      listening: "Listening...",
-      processing: "Processing...",
-      transcribing: "Transcribing...",
-    },
-  };
+  const { t } = useTranslation();
 
   const config = {
     ...statusConfig[status],
-    label: labels[uiLanguage][status],
+    label: t(`status.${status}`),
   };
 
   return (

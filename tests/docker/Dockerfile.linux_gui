@@ -1,5 +1,5 @@
-# Dockerfile for Linux GUI Testing (Tauri v2 + Next.js)
-FROM ubuntu:22.04
+# Dockerfile for Linux GUI Testing (Tauri v2 + Next.js) with CUDA Support
+FROM nvidia/cuda:12.2.2-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     wget \
     git \
+    cmake \
     python3 \
     python3-pip \
     python3-venv \
@@ -25,59 +26,66 @@ RUN apt-get update && apt-get install -y \
     libxdo-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install Node.js (LTS)
+# 2. Build whisper.cpp with CUDA support
+WORKDIR /build-whisper
+# Fix for libcuda.so.1 missing during docker build (link against stubs)
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}"
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 || true
+RUN git clone https://github.com/ggerganov/whisper.cpp.git . && \
+    cmake -B build -DGGML_CUDA=1 && \
+    cmake --build build --config Release -j$(nproc)
+
+# 3. Install Node.js (LTS)
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     npm install -g yarn
 
-# 2b. Install Bun
+# 3b. Install Bun
 RUN curl -fsSL https://bun.sh/install | bash
 ENV BUN_INSTALL="/root/.bun"
 ENV PATH="$BUN_INSTALL/bin:$PATH"
 
-# 3. Install Rust
+# 4. Install Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
-# 4. Setup Working Directory
+# 5. Setup Working Directory
 WORKDIR /app
 
-# 5. Copy Dependencies first (Caching)
+# 6. Copy Dependencies first (Caching)
 COPY package.json package-lock.json ./
 COPY src-tauri/tauri.conf.json src-tauri/Cargo.toml ./src-tauri/
 
-# 6. Install Node Deps
+# 7. Install Node Deps
 RUN npm install --legacy-peer-deps
 
-# 7. Copy Source Code
+# 8. Copy Source Code
 COPY . .
 
-# 8. Build logic or Dev logic?
-# For GUI testing, we can try to run 'tauri dev' but we need to bind to 0.0.0.0 for Next.js
-# Or build the binary and run it. Building is safer relative to dev server port mapping issues.
-# Let's try to build the bundle.
-# Note: This might take a while.
-RUN npm run build
+# 9. Prepare Resources (WhisperCPP)
+RUN mkdir -p src-tauri/resources/whispercpp && \
+    cp /build-whisper/build/bin/whisper-cli src-tauri/resources/whispercpp/ && \
+    cp /build-whisper/build/bin/whisper-server src-tauri/resources/whispercpp/ && \
+    cp /build-whisper/build/bin/libwhisper.so src-tauri/resources/whispercpp/
 
-# 9. Run the App
-# We assume X11 forwarding is set up in the runner script
-# 8. Build Linux Audio Engine
+# 10. Build Linux Audio Engine
 RUN pip3 install pyinstaller
 RUN pyinstaller --clean --noconfirm --onefile --name audio-engine python/audio_engine.py --distpath dist
 
-# 9. Patch tauri.conf.json for Linux (Remove Windows resources, add Linux binary)
-# We use a simple python script to modify the JSON safely
+# 11. Patch tauri.conf.json for Linux (Correct paths for bundled resources)
 RUN python3 -c "import json; \
     f = 'src-tauri/tauri.conf.json'; \
     data = json.load(open(f)); \
-    data['bundle']['resources'] = ['../dist/audio-engine', '../python/audio_engine.py']; \
+    data['bundle']['resources'] = [ \
+    '../dist/audio-engine', \
+    '../python/audio_engine.py', \
+    'resources/whispercpp/whisper-cli', \
+    'resources/whispercpp/whisper-server', \
+    'resources/whispercpp/libwhisper.so' \
+    ]; \
     json.dump(data, open(f, 'w'), indent=4)"
 
-# 10. Build the App
-# We user bun/npm to build
+# 12. Build the App
 RUN npm run build
 
-# 11. Run the App
-# We assume X11 forwarding is set up in the runner script
+# 13. Run the App
 CMD ["npm", "run", "tauri", "dev"]
-# Actually, just run the binary if built
-# CMD ["./src-tauri/target/release/veloce"]

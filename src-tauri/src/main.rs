@@ -2,528 +2,28 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use tauri::{AppHandle, Manager, Emitter, Runtime, WindowEvent};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutEvent, ShortcutState};
-// Note: Imports might vary based on exact plugin version. 
-// Assuming tauri-plugin-global-shortcut 2.x
-
-use tauri_plugin_shell::ShellExt;
-use tauri_plugin_shell::process::{CommandEvent, CommandChild};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 use std::sync::{Arc, Mutex};
-use std::path::PathBuf;
-use std::fs;
-use enigo::{Enigo, Key, Keyboard, Settings, Direction};
-#[cfg(windows)]
-use winreg::RegKey;
-#[cfg(windows)]
-use winreg::enums::HKEY_CURRENT_USER;
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct EngineSettings {
-    microphone: String,
-    model: String,
-    model_dir: String,
-    language: String,
-    gpu_enabled: bool,
-    backend: String,
-}
+mod state;
+mod engine;
+mod shortcuts;
+mod startup;
+mod downloader;
+mod python_setup;
 
-struct AppState {
-    sidecar_child: Arc<Mutex<Option<CommandChild>>>,
-    recording: Arc<Mutex<bool>>,
-    capture_mode: Arc<Mutex<String>>,
-    capture_shortcut: Arc<Mutex<Option<Shortcut>>>,
-    clipboard_mode: Arc<Mutex<bool>>,
-    clipboard_auto_paste: Arc<Mutex<bool>>,
-    engine_settings: Arc<Mutex<EngineSettings>>,
-}
-
-const EMBEDDED_AUDIO_ENGINE: &str = include_str!("../../python/audio_engine.py");
-
-#[derive(serde::Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct HotkeyConfig {
-    key: String,
-    ctrl_key: bool,
-    shift_key: bool,
-    alt_key: bool,
-    meta_key: bool,
-}
-
-fn key_to_code(key: &str) -> Option<Code> {
-    // Check for literal space BEFORE trimming (trim would erase it)
-    if key == " " || key.trim().eq_ignore_ascii_case("space") {
-        return Some(Code::Space);
-    }
-    let normalized = key.trim().to_lowercase();
-    match normalized.as_str() {
-        "home" => Some(Code::Home),
-        "end" => Some(Code::End),
-        "insert" => Some(Code::Insert),
-        "delete" => Some(Code::Delete),
-        "enter" => Some(Code::Enter),
-        "tab" => Some(Code::Tab),
-        "backspace" => Some(Code::Backspace),
-        "escape" | "esc" => Some(Code::Escape),
-        "arrowup" | "up" => Some(Code::ArrowUp),
-        "arrowdown" | "down" => Some(Code::ArrowDown),
-        "arrowleft" | "left" => Some(Code::ArrowLeft),
-        "arrowright" | "right" => Some(Code::ArrowRight),
-        "f1" => Some(Code::F1),
-        "f2" => Some(Code::F2),
-        "f3" => Some(Code::F3),
-        "f4" => Some(Code::F4),
-        "f5" => Some(Code::F5),
-        "f6" => Some(Code::F6),
-        "f7" => Some(Code::F7),
-        "f8" => Some(Code::F8),
-        "f9" => Some(Code::F9),
-        "f10" => Some(Code::F10),
-        "f11" => Some(Code::F11),
-        "f12" => Some(Code::F12),
-        "0" => Some(Code::Digit0),
-        "1" => Some(Code::Digit1),
-        "2" => Some(Code::Digit2),
-        "3" => Some(Code::Digit3),
-        "4" => Some(Code::Digit4),
-        "5" => Some(Code::Digit5),
-        "6" => Some(Code::Digit6),
-        "7" => Some(Code::Digit7),
-        "8" => Some(Code::Digit8),
-        "9" => Some(Code::Digit9),
-        "a" => Some(Code::KeyA),
-        "b" => Some(Code::KeyB),
-        "c" => Some(Code::KeyC),
-        "d" => Some(Code::KeyD),
-        "e" => Some(Code::KeyE),
-        "f" => Some(Code::KeyF),
-        "g" => Some(Code::KeyG),
-        "h" => Some(Code::KeyH),
-        "i" => Some(Code::KeyI),
-        "j" => Some(Code::KeyJ),
-        "k" => Some(Code::KeyK),
-        "l" => Some(Code::KeyL),
-        "m" => Some(Code::KeyM),
-        "n" => Some(Code::KeyN),
-        "o" => Some(Code::KeyO),
-        "p" => Some(Code::KeyP),
-        "q" => Some(Code::KeyQ),
-        "r" => Some(Code::KeyR),
-        "s" => Some(Code::KeyS),
-        "t" => Some(Code::KeyT),
-        "u" => Some(Code::KeyU),
-        "v" => Some(Code::KeyV),
-        "w" => Some(Code::KeyW),
-        "x" => Some(Code::KeyX),
-        "y" => Some(Code::KeyY),
-        "z" => Some(Code::KeyZ),
-        _ => None,
-    }
-}
-
-fn shortcut_from_config(config: &HotkeyConfig) -> Result<Shortcut, String> {
-    let code = key_to_code(&config.key)
-        .ok_or_else(|| format!("Hotkey no soportada: {}", config.key))?;
-
-    let mut modifiers = Modifiers::empty();
-    if config.ctrl_key {
-        modifiers |= Modifiers::CONTROL;
-    }
-    if config.shift_key {
-        modifiers |= Modifiers::SHIFT;
-    }
-    if config.alt_key {
-        modifiers |= Modifiers::ALT;
-    }
-    if config.meta_key {
-        modifiers |= Modifiers::SUPER;
-    }
-
-    if modifiers.is_empty() {
-        Ok(Shortcut::new(None, code))
-    } else {
-        Ok(Shortcut::new(Some(modifiers), code))
-    }
-}
-
-fn register_capture_shortcut<R: Runtime>(
-    app: &AppHandle<R>,
-    state: &tauri::State<AppState>,
-    config: HotkeyConfig,
-) -> Result<(), String> {
-    let new_shortcut = shortcut_from_config(&config)?;
-
-    let mut lock = state.capture_shortcut.lock().map_err(|e| e.to_string())?;
-    if let Some(previous_shortcut) = lock.take() {
-        let _ = app.global_shortcut().unregister(previous_shortcut);
-    }
-
-    app.global_shortcut()
-        .register(new_shortcut)
-        .map_err(|error| format!("No se pudo registrar el atajo global: {error}"))?;
-
-    *lock = Some(new_shortcut);
-    Ok(())
-}
-
-fn stop_audio_engine(state: &tauri::State<AppState>) {
-    if let Ok(mut lock) = state.sidecar_child.lock() {
-        if let Some(child) = lock.take() {
-            let _ = child.kill();
-        }
-    }
-}
-
-#[cfg(windows)]
-fn set_startup_enabled_on_windows(enabled: bool) -> Result<(), String> {
-    let executable = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(error) => return Err(error.to_string()),
-    };
-
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let (run_key, _) = hkcu
-        .create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-        .map_err(|error| error.to_string())?;
-
-    if enabled {
-        let command = format!("\"{}\"", executable.display());
-        run_key
-            .set_value("Veloce", &command)
-            .map_err(|error| error.to_string())?;
-    } else {
-        let _ = run_key.delete_value("Veloce");
-    }
-
-    Ok(())
-}
-
-#[cfg(windows)]
-fn get_startup_enabled_on_windows() -> bool {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let run_key = match hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run") {
-        Ok(key) => key,
-        Err(_) => return false,
-    };
-
-    run_key.get_value::<String, _>("Veloce").is_ok()
-}
-
-#[cfg(not(windows))]
-fn set_startup_enabled_on_windows(_enabled: bool) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn get_startup_enabled_on_windows() -> bool {
-    false
-}
-
-fn ensure_embedded_audio_engine_script<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
-    let app_data_dir = app.path().app_data_dir().ok()?;
-    let engine_dir = app_data_dir.join("engine");
-    if fs::create_dir_all(&engine_dir).is_err() {
-        return None;
-    }
-
-    let script_path = engine_dir.join("audio_engine_embedded.py");
-    let should_write = match fs::read_to_string(&script_path) {
-        Ok(existing) => existing != EMBEDDED_AUDIO_ENGINE,
-        Err(_) => true,
-    };
-
-    if should_write && fs::write(&script_path, EMBEDDED_AUDIO_ENGINE).is_err() {
-        return None;
-    }
-
-    Some(script_path)
-}
-
-fn write_engine_command(state: &tauri::State<AppState>, command: &str) -> Result<(), String> {
-    let mut lock = state.sidecar_child.lock().map_err(|e| e.to_string())?;
-    let Some(child) = lock.as_mut() else {
-        return Err("Audio engine is not running".to_string());
-    };
-
-    if let Err(error) = child.write(command.as_bytes()) {
-        *lock = None;
-        return Err(error.to_string());
-    }
-
-    Ok(())
-}
-
-fn resolve_audio_engine_executable<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
-    let mut executable_candidates: Vec<PathBuf> = Vec::new();
-
-    if let Ok(current_dir) = std::env::current_dir() {
-        executable_candidates.push(current_dir.join("dist/audio-engine.exe"));
-        executable_candidates.push(current_dir.join("audio-engine.exe"));
-        executable_candidates.push(current_dir.join("../dist/audio-engine.exe"));
-        
-        // Linux/Unix candidates
-        executable_candidates.push(current_dir.join("dist/audio-engine"));
-        executable_candidates.push(current_dir.join("audio-engine"));
-        executable_candidates.push(current_dir.join("../dist/audio-engine"));
-    }
-
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(exe_dir) = executable.parent() {
-            executable_candidates.push(exe_dir.join("audio-engine.exe"));
-            executable_candidates.push(exe_dir.join("dist/audio-engine.exe"));
-            executable_candidates.push(exe_dir.join("_up_/audio-engine.exe"));
-            executable_candidates.push(exe_dir.join("_up_/dist/audio-engine.exe"));
-            executable_candidates.push(exe_dir.join("resources/audio-engine.exe"));
-            executable_candidates.push(exe_dir.join("resources/dist/audio-engine.exe"));
-
-            // Linux/Unix candidates
-            executable_candidates.push(exe_dir.join("audio-engine"));
-            executable_candidates.push(exe_dir.join("dist/audio-engine"));
-            executable_candidates.push(exe_dir.join("_up_/audio-engine"));
-            executable_candidates.push(exe_dir.join("_up_/dist/audio-engine"));
-            executable_candidates.push(exe_dir.join("resources/audio-engine"));
-            executable_candidates.push(exe_dir.join("resources/dist/audio-engine"));
-        }
-    }
-
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        executable_candidates.push(resource_dir.join("audio-engine.exe"));
-        executable_candidates.push(resource_dir.join("dist/audio-engine.exe"));
-        executable_candidates.push(resource_dir.join("resources/audio-engine.exe"));
-        executable_candidates.push(resource_dir.join("resources/dist/audio-engine.exe"));
-
-        // Linux/Unix candidates
-        executable_candidates.push(resource_dir.join("audio-engine"));
-        executable_candidates.push(resource_dir.join("dist/audio-engine"));
-        executable_candidates.push(resource_dir.join("resources/audio-engine"));
-        executable_candidates.push(resource_dir.join("resources/dist/audio-engine"));
-    }
-
-    executable_candidates
-        .into_iter()
-        .find(|path| path.exists() && path.is_file())
-}
-
-fn resolve_audio_engine_script<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
-    let mut script_candidates: Vec<PathBuf> = Vec::new();
-
-    if let Some(embedded_script) = ensure_embedded_audio_engine_script(app) {
-        script_candidates.push(embedded_script);
-    }
-
-    if let Ok(current_dir) = std::env::current_dir() {
-        script_candidates.push(current_dir.join("python/audio_engine.py"));
-        script_candidates.push(current_dir.join("../python/audio_engine.py"));
-    }
-
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(exe_dir) = executable.parent() {
-            script_candidates.push(exe_dir.join("audio_engine.py"));
-            script_candidates.push(exe_dir.join("python/audio_engine.py"));
-            script_candidates.push(exe_dir.join("resources/audio_engine.py"));
-            script_candidates.push(exe_dir.join("resources/python/audio_engine.py"));
-        }
-    }
-
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        script_candidates.push(resource_dir.join("audio_engine.py"));
-        script_candidates.push(resource_dir.join("python/audio_engine.py"));
-        script_candidates.push(resource_dir.join("resources/audio_engine.py"));
-        script_candidates.push(resource_dir.join("resources/python/audio_engine.py"));
-    }
-
-    script_candidates.into_iter().find(|path| path.exists())
-}
-
-fn spawn_audio_engine<R: Runtime>(app_handle: &AppHandle<R>, child_arc: Arc<Mutex<Option<CommandChild>>>) -> Result<(), String> {
-    if let Ok(lock) = child_arc.lock() {
-        if lock.is_some() {
-            return Ok(());
-        }
-    }
-
-    let sidecar_command = if let Some(engine_executable) = resolve_audio_engine_executable(app_handle) {
-        app_handle
-            .shell()
-            .command(engine_executable.to_string_lossy().to_string())
-    } else {
-        let script_path = resolve_audio_engine_script(app_handle)
-            .ok_or_else(|| "Audio engine executable/script not found in dev/bundle paths".to_string())?;
-
-        app_handle
-            .shell()
-            .command("python")
-            .args([script_path.to_string_lossy().to_string()])
-    };
-
-    let (mut rx, child) = sidecar_command
-        .spawn()
-        .map_err(|error| format!("No se pudo iniciar el motor de audio embebido. Detalle: {error}"))?;
-
-    if let Ok(mut lock) = child_arc.lock() {
-        *lock = Some(child);
-    }
-
-    let app_handle_clone = app_handle.clone();
-    let child_arc_for_events = child_arc.clone();
-    tauri::async_runtime::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match event {
-                CommandEvent::Stdout(line_bytes) => {
-                    let line = String::from_utf8_lossy(&line_bytes);
-                    if let Ok(msg) = serde_json::from_str::<SidecarMessage>(&line) {
-                        if let Some(text) = msg.transcription {
-                            let response_ms = msg.response_ms;
-                            let recording_id = msg.recording_id;
-                            let _ = app_handle_clone.emit("transcription-update", serde_json::json!({
-                                "text": text.clone(),
-                                "response_ms": response_ms,
-                                "recording_id": recording_id,
-                            }));
-
-                            let mut enigo = match Enigo::new(&Settings::default()) {
-                                Ok(instance) => instance,
-                                Err(_) => continue,
-                            };
-
-                            let state = app_handle_clone.state::<AppState>();
-                            let use_clipboard = *state.clipboard_mode.lock().unwrap();
-                            let auto_paste = *state.clipboard_auto_paste.lock().unwrap();
-
-                            if use_clipboard {
-                                let mut clipboard_updated = false;
-                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                    if clipboard.set_text(&text).is_ok() {
-                                        clipboard_updated = true;
-                                    }
-                                }
-
-                                if clipboard_updated && auto_paste {
-                                    let _ = enigo.key(Key::Control, Direction::Press);
-                                    let _ = enigo.key(Key::Unicode('v'), Direction::Click);
-                                    let _ = enigo.key(Key::Control, Direction::Release);
-                                    
-                                    // Security: Clear clipboard after a delay to prevent sensitive data persistence
-                                    let text_clone = text.clone();
-                                    std::thread::spawn(move || {
-                                        std::thread::sleep(std::time::Duration::from_secs(10));
-                                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                                            // Only clear if the current content matches what we put in (to avoid clearing user's new copy)
-                                            if let Ok(current_text) = cb.get_text() {
-                                                if current_text == text_clone {
-                                                    let _ = cb.clear();
-                                                }
-                                            }
-                                        }
-                                    });
-                                } else if !clipboard_updated {
-                                    let _ = app_handle_clone.emit("engine-error", "No se pudo actualizar el portapapeles; se evitó pegar texto anterior.");
-                                }
-                            } else {
-                                let _ = enigo.text(&text);
-                            }
-                        }
-
-                        if let Some(error) = msg.error {
-                            let _ = app_handle_clone.emit("engine-error", error);
-                        }
-
-                        if let Some(log) = msg.log {
-                            let _ = app_handle_clone.emit("engine-log", log);
-                        }
-
-                        if let Some(status) = msg.status {
-                            let _ = app_handle_clone.emit("status-update", status);
-                        }
-
-                        if let Some(msg_type) = msg.msg_type {
-                            if msg_type == "hardware-info" {
-                                let _ = app_handle_clone.emit("hardware-info", serde_json::json!({
-                                    "microphones": msg.microphones,
-                                    "models": msg.models,
-                                    "gpu": msg.gpu,
-                                    "backends": msg.backends
-                                }));
-                            } else if msg_type == "model-download-progress" {
-                                let _ = app_handle_clone.emit("model-download-progress", serde_json::json!({
-                                    "model": msg.model,
-                                    "progress": msg.progress
-                                }));
-                            }
-                        }
-                    }
-                }
-                CommandEvent::Stderr(line_bytes) => {
-                    let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
-                    let ignored_patterns = [
-                        "warnings.warn(message)",
-                        "UserWarning:",
-                        "You are sending unauthenticated requests to the HF Hub",
-                        "huggingface_hub",
-                        "To support symlinks on Windows",
-                    ];
-                    let should_ignore = ignored_patterns.iter().any(|pattern| line.contains(pattern));
-
-                    if !line.is_empty() && !should_ignore {
-                        let _ = app_handle_clone.emit("engine-error", line);
-                    }
-                }
-                CommandEvent::Error(error) => {
-                    let _ = app_handle_clone.emit("engine-error", format!("Engine error: {error}"));
-                }
-                CommandEvent::Terminated(payload) => {
-                    if let Ok(mut lock) = child_arc_for_events.lock() {
-                        *lock = None;
-                    }
-                    let code = payload.code.map_or("unknown".to_string(), |c| c.to_string());
-                    let _ = app_handle_clone.emit("engine-error", format!("Audio engine closed (code {code})"));
-                    let _ = app_handle_clone.emit("status-update", "stopped");
-                }
-                _ => {}
-            }
-        }
-    });
-
-    Ok(())
-}
-
-#[derive(serde::Deserialize)]
-struct SidecarMessage {
-    status: Option<String>,
-    transcription: Option<String>,
-    #[serde(default)]
-    response_ms: Option<f64>,
-    #[serde(default)]
-    recording_id: Option<u64>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    log: Option<String>,
-    // New fields for hardware info
-    #[serde(rename = "type")]
-    msg_type: Option<String>,
-    #[serde(default)]
-    microphones: Option<serde_json::Value>,
-    #[serde(default)]
-    models: Option<serde_json::Value>,
-    #[serde(default)]
-    gpu: Option<serde_json::Value>,
-    #[serde(default)]
-    backends: Option<serde_json::Value>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    progress: Option<u8>,
-}
+use state::{AppState, EngineSettings};
+use shortcuts::HotkeyConfig;
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(handle_shortcut).build())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(shortcuts::handle_shortcut).build())
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {
                 let state = window.state::<AppState>();
-                stop_audio_engine(&state);
+                engine::stop_audio_engine(&state);
             }
         })
         .setup(|app| {
@@ -550,14 +50,32 @@ fn main() {
                 })),
             });
 
-            if let Err(error) = spawn_audio_engine(&app_handle, child_arc.clone()) {
-                let _ = app_handle.emit("engine-error", error);
-            }
+            let app_handle_clone = app_handle.clone();
+            let child_arc_clone = child_arc.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = engine::spawn_audio_engine(&app_handle_clone, child_arc_clone.clone()).await {
+                    println!("[RUST] Startup spawn failed: {}", error);
+                    println!("[RUST] Attempting auto-recovery/setup...");
+                    let _ = app_handle_clone.emit("status-update", "Iniciando configuración automática...");
+                    
+                    match engine::install_engine(&app_handle_clone).await {
+                        Ok(_) => {
+                            println!("[RUST] Setup complete. Retrying spawn...");
+                            if let Err(e2) = engine::spawn_audio_engine(&app_handle_clone, child_arc_clone).await {
+                                    let _ = app_handle_clone.emit("engine-error", format!("Error al iniciar tras configuración: {}", e2));
+                            }
+                        },
+                        Err(e_install) => {
+                                let _ = app_handle_clone.emit("engine-error", format!("Fallo en configuración: {}", e_install));
+                        }
+                    }
+                }
+            });
             
             // Register Shortcuts
             let shortcut_focus = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyV);
 
-            if let Err(error) = register_capture_shortcut(
+            if let Err(error) = shortcuts::register_capture_shortcut(
                 &app_handle,
                 &app_handle.state::<AppState>(),
                 HotkeyConfig {
@@ -576,9 +94,29 @@ fn main() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![set_clipboard_settings, toggle_recording, set_capture_mode, set_capture_hotkey, set_engine_settings, refresh_hardware, download_model, get_startup_enabled, set_startup_enabled])
+        .invoke_handler(tauri::generate_handler![
+            set_clipboard_settings,
+            set_clipboard,
+            type_text,
+            press_paste_shortcut,
+            toggle_recording,
+            set_capture_mode,
+            set_capture_hotkey,
+            set_engine_settings,
+            refresh_hardware,
+            download_model,
+            delete_model,
+            get_startup_enabled,
+            set_startup_enabled,
+            install_audio_engine
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[tauri::command]
+async fn install_audio_engine(app: AppHandle) -> Result<(), String> {
+    engine::install_engine(&app).await
 }
 
 #[tauri::command]
@@ -591,9 +129,43 @@ fn set_clipboard_settings(state: tauri::State<AppState>, enabled: bool, auto_pas
 }
 
 #[tauri::command]
-fn toggle_recording<R: Runtime>(app: AppHandle<R>, state: tauri::State<AppState>) -> Result<bool, String> {
+fn set_clipboard(text: String) -> Result<(), String> {
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        if clipboard.set_text(text).is_ok() {
+            return Ok(());
+        }
+    }
+    Err("Failed to copy to clipboard".to_string())
+}
+
+#[tauri::command]
+fn type_text(text: String) -> Result<(), String> {
+    use enigo::{Enigo, Keyboard, Settings};
+    let mut enigo = match Enigo::new(&Settings::default()) {
+        Ok(instance) => instance,
+        Err(_) => return Err("Failed to init enigo".to_string()),
+    };
+    let _ = enigo.text(&text);
+    Ok(())
+}
+
+#[tauri::command]
+fn press_paste_shortcut() -> Result<(), String> {
+    use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+    let mut enigo = match Enigo::new(&Settings::default()) {
+        Ok(instance) => instance,
+        Err(_) => return Err("Failed to init enigo".to_string()),
+    };
+    let _ = enigo.key(Key::Control, Direction::Press);
+    let _ = enigo.key(Key::Unicode('v'), Direction::Click);
+    let _ = enigo.key(Key::Control, Direction::Release);
+    Ok(())
+}
+
+#[tauri::command]
+async fn toggle_recording<R: Runtime>(app: AppHandle<R>, state: tauri::State<'_, AppState>) -> Result<bool, String> {
     if state.sidecar_child.lock().map_err(|e| e.to_string())?.is_none() {
-        if let Err(error) = spawn_audio_engine(&app, state.sidecar_child.clone()) {
+        if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await {
             let _ = app.emit("engine-error", error);
             return Ok(false);
         }
@@ -603,7 +175,7 @@ fn toggle_recording<R: Runtime>(app: AppHandle<R>, state: tauri::State<AppState>
     *recording = !*recording;
 
     let cmd = if *recording { "START\n" } else { "STOP\n" };
-    if let Err(error) = write_engine_command(&state, cmd) {
+    if let Err(error) = engine::write_engine_command(&state, cmd) {
         *recording = false;
         let _ = app.emit("recording-state", false);
         let _ = app.emit("engine-error", format!("No se pudo enviar comando al motor: {error}"));
@@ -625,7 +197,7 @@ fn set_capture_mode(state: tauri::State<AppState>, mode: String) -> Result<(), S
 
 #[tauri::command]
 fn set_capture_hotkey(app: AppHandle, state: tauri::State<AppState>, hotkey: HotkeyConfig) -> Result<(), String> {
-    register_capture_shortcut(&app, &state, hotkey)
+    shortcuts::register_capture_shortcut(&app, &state, hotkey)
 }
 
 #[tauri::command]
@@ -660,7 +232,7 @@ fn set_engine_settings(
     });
 
     let cmd = format!("CONFIG {}\n", payload);
-    if let Err(error) = write_engine_command(&state, &cmd) {
+    if let Err(error) = engine::write_engine_command(&state, &cmd) {
         let _ = app.emit("engine-error", format!("No se pudo actualizar configuración del motor: {error}"));
     }
 
@@ -668,15 +240,15 @@ fn set_engine_settings(
 }
 
 #[tauri::command]
-fn refresh_hardware(app: AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+async fn refresh_hardware(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     if state.sidecar_child.lock().map_err(|e| e.to_string())?.is_none() {
-        if let Err(error) = spawn_audio_engine(&app, state.sidecar_child.clone()) {
+        if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await {
             let _ = app.emit("engine-error", error);
             return Ok(());
         }
     }
 
-    if let Err(error) = write_engine_command(&state, "HARDWARE\n") {
+    if let Err(error) = engine::write_engine_command(&state, "HARDWARE\n") {
         let _ = app.emit("engine-error", format!("No se pudo consultar hardware: {error}"));
     }
     Ok(())
@@ -684,141 +256,70 @@ fn refresh_hardware(app: AppHandle, state: tauri::State<AppState>) -> Result<(),
 
 #[tauri::command]
 fn get_startup_enabled() -> bool {
-    get_startup_enabled_on_windows()
+    startup::get_startup_enabled()
 }
 
 #[tauri::command]
 fn set_startup_enabled(enabled: bool) -> Result<(), String> {
-    set_startup_enabled_on_windows(enabled)
+    startup::set_startup_enabled(enabled)
 }
 
 #[tauri::command]
-fn download_model(app: AppHandle, state: tauri::State<AppState>, model: String) -> Result<(), String> {
+async fn download_model(app: AppHandle, state: tauri::State<'_, AppState>, model: String, download_dir: Option<String>) -> Result<(), String> {
     let model = model.trim().to_string();
     if model.is_empty() {
         return Err("Model name is required".to_string());
     }
 
     if state.sidecar_child.lock().map_err(|e| e.to_string())?.is_none() {
-        if let Err(error) = spawn_audio_engine(&app, state.sidecar_child.clone()) {
+        if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await {
             let _ = app.emit("engine-error", error.clone());
             return Err(error);
         }
     }
 
-    let cmd = format!("DOWNLOAD {}\n", model);
-    if let Err(error) = write_engine_command(&state, &cmd) {
+    let payload = serde_json::json!({
+        "model": model,
+        "dir": download_dir
+    });
+    
+    let cmd = format!("DOWNLOAD {}\n", payload.to_string());
+    if let Err(error) = engine::write_engine_command(&state, &cmd) {
         let message = format!("No se pudo descargar el modelo {model}: {error}");
         let _ = app.emit("engine-error", message.clone());
         return Err(message);
     } else {
-        let _ = app.emit("engine-log", format!("Descargando modelo: {model}"));
+        let _ = app.emit("engine-log", format!("Iniciando descarga de modelo: {model}"));
     }
     Ok(())
 }
 
-fn handle_shortcut<R: Runtime>(app: &AppHandle<R>, shortcut: &Shortcut, event: ShortcutEvent) {
-    let state = app.state::<AppState>();
-    let capture_shortcut = state
-        .capture_shortcut
-        .lock()
-        .map(|value| value.clone())
-        .unwrap_or(None);
-
-    if let Some(active_capture_shortcut) = capture_shortcut {
-        if *shortcut != active_capture_shortcut {
-            if shortcut.matches(Modifiers::CONTROL | Modifiers::ALT, Code::KeyV) {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_focus();
-                    let _ = window.unminimize();
-                }
-            }
-            return;
-        }
-
-        let capture_mode = state
-            .capture_mode
-            .lock()
-            .map(|mode| mode.clone())
-            .unwrap_or_else(|_| "toggle".to_string());
-
-        if capture_mode == "hold" {
-            let target_recording = match event.state() {
-                ShortcutState::Pressed => true,
-                ShortcutState::Released => false,
-            };
-
-            let mut recording = match state.recording.lock() {
-                Ok(lock) => lock,
-                Err(_) => return,
-            };
-
-            if *recording == target_recording {
-                return;
-            }
-
-            *recording = target_recording;
-            let cmd = if *recording { "START\n" } else { "STOP\n" };
-
-            if let Ok(mut lock) = state.sidecar_child.lock() {
-                if let Some(child) = lock.as_mut() {
-                    if child.write(cmd.as_bytes()).is_err() {
-                        *lock = None;
-                        *recording = false;
-                        let _ = app.emit("recording-state", false);
-                        let _ = app.emit("engine-error", "No se pudo enviar comando al motor de audio");
-                        return;
-                    }
-                } else {
-                    *recording = false;
-                    let _ = app.emit("recording-state", false);
-                    let _ = app.emit("engine-error", "El motor de audio no está disponible");
-                    return;
-                }
-            }
-
-            let _ = app.emit("recording-state", *recording);
-            return;
-        }
-
-        if event.state() == ShortcutState::Released {
-            return;
-        }
-
-        let mut recording = match state.recording.lock() {
-            Ok(lock) => lock,
-            Err(_) => return,
-        };
-        *recording = !*recording;
-
-        let cmd = if *recording { "START\n" } else { "STOP\n" };
-
-        if let Ok(mut lock) = state.sidecar_child.lock() {
-            if let Some(child) = lock.as_mut() {
-                if child.write(cmd.as_bytes()).is_err() {
-                    *lock = None;
-                    *recording = false;
-                    let _ = app.emit("recording-state", false);
-                    let _ = app.emit("engine-error", "No se pudo enviar comando al motor de audio");
-                    return;
-                }
-            } else {
-                *recording = false;
-                let _ = app.emit("recording-state", false);
-                let _ = app.emit("engine-error", "El motor de audio no está disponible");
-                return;
-            }
-        }
-
-        let _ = app.emit("recording-state", *recording);
-        return;
+#[tauri::command]
+async fn delete_model(app: AppHandle, state: tauri::State<'_, AppState>, model: String, path: Option<String>) -> Result<(), String> {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("Model name is required".to_string());
     }
 
-    if shortcut.matches(Modifiers::CONTROL | Modifiers::ALT, Code::KeyV) {
-        // Focus Window
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.set_focus();
-            let _ = window.unminimize();
+    if state.sidecar_child.lock().map_err(|e| e.to_string())?.is_none() {
+        if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await {
+            let _ = app.emit("engine-error", error.clone());
+            return Err(error);
         }
     }
+
+    let payload = serde_json::json!({
+        "model": model,
+        "path": path
+    });
+    
+    let cmd = format!("DELETE_MODEL {}\n", payload.to_string());
+    if let Err(error) = engine::write_engine_command(&state, &cmd) {
+        let message = format!("No se pudo eliminar el modelo {model}: {error}");
+        let _ = app.emit("engine-error", message.clone());
+        return Err(message);
+    } else {
+        let _ = app.emit("engine-log", format!("Solicitando eliminación de modelo: {model}"));
+    }
+    Ok(())
 }

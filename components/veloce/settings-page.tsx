@@ -3,14 +3,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from "@/components/ui/dialog";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import {
   Select,
   SelectContent,
   SelectItem,
@@ -23,6 +15,8 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { KeybindRecorder } from "@/components/veloce/keybind-recorder";
 import type { HotkeyCombo } from "@/hooks/use-hotkey";
+import { ArrowLeft } from "lucide-react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 type DownloadStatus = "idle" | "starting" | "downloading" | "completed" | "error";
 
@@ -34,9 +28,8 @@ type ModelDownloadState = {
   unit?: string;
 };
 
-interface SettingsModalProps {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
+interface SettingsPageProps {
+  onBack: () => void;
   microphone: string;
   onMicrophoneChange: (value: string) => void;
   model: string;
@@ -84,11 +77,11 @@ interface SettingsModalProps {
   onClipboardAutoPasteChange: (enabled: boolean) => void;
   onRefreshHardware: () => void;
   onSave: () => void;
+  className?: string;
 }
 
-export function SettingsModal({
-  open,
-  onOpenChange,
+export function SettingsPage({
+  onBack,
   microphone,
   onMicrophoneChange,
   model,
@@ -135,7 +128,8 @@ export function SettingsModal({
   onClipboardAutoPasteChange,
   onRefreshHardware,
   onSave,
-}: SettingsModalProps) {
+  className,
+}: SettingsPageProps) {
   const { t } = useTranslation();
   const [showDownloads, setShowDownloads] = useState(false);
 
@@ -264,11 +258,6 @@ export function SettingsModal({
       });
 
       if (selected && typeof selected === "string") {
-        // If we pick a specific file, we might want to set the model to that file path
-        // or handle it in a way the backend understands.
-        // For now, let's assume the backend can handle absolute paths in the 'model' field
-        // OR we just treat it as adding a model to the list.
-        // Let's set the model directly.
         onModelChange(selected);
       }
     } catch (error) {
@@ -277,18 +266,20 @@ export function SettingsModal({
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[96vw] max-w-[32rem] max-h-[calc(100vh-1.25rem)] overflow-y-auto overflow-x-hidden rounded-2xl border-border bg-card p-4 [scrollbar-width:thin] [scrollbar-color:hsl(var(--border))_transparent] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border/70 [&::-webkit-scrollbar-thumb:hover]:bg-border [&_*]:min-w-0">
-        <DialogHeader>
-          <DialogTitle className="font-mono text-sm font-medium tracking-wider uppercase text-foreground">
-            {t("settings.title")}
-          </DialogTitle>
-          <DialogDescription className="text-xs text-muted-foreground">
-            {t("settings.description")}
-          </DialogDescription>
-        </DialogHeader>
+    <div className={`flex h-full w-full flex-col bg-background ${className}`}>
+      {/* Header */}
+      <header className="flex items-center gap-3 border-b px-4 py-3 shrink-0">
+        <Button variant="ghost" size="icon" onClick={onBack} className="h-8 w-8 rounded-full" aria-label={t("library.back")}>
+          <ArrowLeft className="h-4 w-4" />
+        </Button>
+        <h2 className="font-mono text-sm font-medium uppercase tracking-wider text-foreground">
+          {t("settings.title")}
+        </h2>
+      </header>
 
-        <div className="flex flex-col gap-5 pt-2">
+      {/* Main Content */}
+      <div className="flex-1 overflow-y-auto overflow-x-hidden p-4 [scrollbar-width:thin] [scrollbar-color:hsl(var(--border))_transparent] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border/70 [&::-webkit-scrollbar-thumb:hover]:bg-border [&_*]:min-w-0">
+        <div className="flex flex-col gap-5 max-w-2xl mx-auto">
           {/* Keyboard Shortcuts Section */}
           <div className="flex flex-col gap-3">
             <span className="font-mono text-[11px] font-medium tracking-wider uppercase text-muted-foreground">
@@ -528,7 +519,7 @@ export function SettingsModal({
                 {backendOptions.map((option) => {
                   const backendState = backendMap.get(option.id);
                   const isAvailable = option.id === "auto" || backendState?.available !== false;
-                  const suffix = isAvailable ? "" : ` (${t("settings.whispercpp_unavailable").replace("whisper.cpp ", "")})`; // Reusing unavailable string part or generic "unavailable" if I had it. Actually, I should just map "unavailable".
+                  const suffix = isAvailable ? "" : ` (${t("settings.whispercpp_unavailable").replace("whisper.cpp ", "")})`;
                   return (
                     <SelectItem key={option.id} value={option.id} disabled={!isAvailable}>
                       {option.label + (isAvailable ? "" : " (unavailable)")}
@@ -774,14 +765,16 @@ export function SettingsModal({
             />
           </div>
 
-          <Button
-            onClick={onSave}
-            className="w-full"
-          >
-            {t("settings.save_changes")}
-          </Button>
+          <div className="pb-8">
+            <Button
+              onClick={onSave}
+              className="w-full"
+            >
+              {t("settings.save_changes")}
+            </Button>
+          </div>
         </div>
-      </DialogContent>
-    </Dialog>
+      </div>
+    </div>
   );
 }

@@ -42,6 +42,8 @@ Con eso, Veloce intentará usar `faster-whisper` con CUDA automáticamente cuand
 2. Descarga un modelo recomendado desde el onboarding.
 3. Espera a que termine y prueba captura.
 
+Nota: si `Backend = Auto` detecta que `faster-whisper` no tiene CUDA en ese equipo y activa `whisper.cpp`, Veloce intentará descargar automáticamente un modelo `ggml` compatible (por defecto `large-v3-turbo`) en la primera ejecución.
+
 ## 4) Configuración recomendada
 
 En `Configuración`:
@@ -67,9 +69,9 @@ En `Configuración`:
 4. En `Configuración`, pulsa `Actualizar`.
 5. Si usas GPU avanzada/whisper.cpp, sigue `docs/WINDOWS_GPU_BACKEND.md`.
 
-### Error al instalar: `Error opening file for writing ... _up_\dist\audio-engine.exe`
+### Error al instalar: `Error opening file for writing ...`
 
-Esto ocurre cuando una instancia previa dejó el engine en uso.
+Esto ocurre cuando una instancia previa dejó archivos en uso (por ejemplo `audio-engine.exe` o DLLs en `resources\whispercpp\`).
 
 Pasos:
 
@@ -80,6 +82,14 @@ Pasos:
 3. Reintenta instalador.
 
 Si persiste, reinicia Windows y ejecuta nuevamente el setup.
+
+Alternativa rápida (recomendado en errores repetidos):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\windows\reinstall-clean.ps1
+```
+
+Ese script cierra procesos de Veloce, elimina `%LOCALAPPDATA%\Veloce` y vuelve a abrir el instalador.
 
 ### App abre pero no transcribe
 

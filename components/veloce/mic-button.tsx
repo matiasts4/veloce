@@ -2,6 +2,7 @@
 
 import { Mic } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
+import { useTranslation } from "react-i18next";
 
 interface MicButtonProps {
   isActive: boolean;
@@ -10,6 +11,7 @@ interface MicButtonProps {
 }
 
 export function MicButton({ isActive, status = "idle", onToggle }: MicButtonProps) {
+  const { t } = useTranslation();
   const isTranscribing = status === "transcribing" || status === "processing";
 
   return (
@@ -91,7 +93,7 @@ export function MicButton({ isActive, status = "idle", onToggle }: MicButtonProp
         }`}
         whileTap={{ scale: 0.95 }}
         whileHover={{ scale: 1.03 }}
-        aria-label={isActive ? "Stop listening" : "Start listening"}
+        aria-label={isActive ? t("status.listening") : t("settings.toggle_capture")}
         aria-pressed={isActive}
       >
         <motion.div

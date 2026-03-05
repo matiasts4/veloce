@@ -31,6 +31,7 @@ echo.
 
 docker run --rm -it ^
   --privileged ^
+  --gpus all ^
   --net=host ^
   -e DISPLAY=%DISPLAY_VAL% ^
   -e WAYLAND_DISPLAY=wayland-0 ^

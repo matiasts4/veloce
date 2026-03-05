@@ -1,0 +1,2 @@
+Started at 1771189727.9978013 with executable: C:\Users\PC\AppData\Local\Programs\Python\Python311\python.exe
+Arguments: ['C:\\Users\\PC\\AppData\\Roaming\\com.veloce.app\\engine\\audio_engine_embedded.py']

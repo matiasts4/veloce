@@ -15,8 +15,8 @@
                 "title": "Veloce",
                 "width": 420,
                 "height": 520,
-                "minWidth": 196,
-                "minHeight": 52,
+                "minWidth": 240,
+                "minHeight": 68,
                 "decorations": false,
                 "transparent": true,
                 "shadow": false,
@@ -36,22 +36,11 @@
             "nsis"
         ],
         "resources": [
-            "../dist/audio-engine.exe",
             "../python/audio_engine.py",
-            "resources/whispercpp/whisper-cli.exe",
-            "resources/whispercpp/whisper-server.exe",
-            "resources/whispercpp/ggml.dll",
-            "resources/whispercpp/whisper.dll",
-            "resources/whispercpp/ggml-base.dll",
-            "resources/whispercpp/ggml-cpu.dll",
-            "resources/whispercpp/ggml-cuda.dll",
-            "resources/whispercpp/cublas64_12.dll",
-            "resources/whispercpp/cublasLt64_12.dll",
-            "resources/whispercpp/cudart64_12.dll",
-            "resources/whispercpp/nvblas64_12.dll",
-            "resources/whispercpp/nvrtc-builtins64_124.dll",
-            "resources/whispercpp/nvrtc64_120_0.dll",
-            "resources/whispercpp/SDL2.dll"
+            "resources/python-3.11.9-embed-amd64.zip",
+            "resources/requirements.txt",
+            "resources/get-pip.py",
+            "resources/whispercpp"
         ],
         "icon": [
             "icons/32x32.png",

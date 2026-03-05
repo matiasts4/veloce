@@ -12,15 +12,231 @@ import uuid
 import re
 import urllib.request
 import urllib.error
+import io
 from collections import deque
 import numpy as np
 import sounddevice as sd
+from queue import Queue, Empty
 from faster_whisper import WhisperModel
 from huggingface_hub import HfApi, snapshot_download
 from tqdm.auto import tqdm
 import torch
+import torchaudio
 import os
 from pathlib import Path
+import logging
+import datetime
+import atexit
+import signal
+
+# Clean up any orphaned whisper-server processes from previous ungraceful exits
+try:
+    subprocess.run(
+        ["taskkill", "/F", "/IM", "whisper-server.exe"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    )
+except Exception:
+    pass
+
+# Setup logging
+def setup_logging():
+    app_data = Path(os.environ.get("APPDATA", ".")) / "Veloce"
+    app_data.mkdir(parents=True, exist_ok=True)
+    log_file = app_data / "audio_engine_debug.log"
+    
+    logging.basicConfig(
+        filename=str(log_file),
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        filemode='w' # Overwrite each run to keep it clean, or 'a' to append
+    )
+    logging.info(f"Audio Engine Started. PID: {os.getpid()}")
+    return log_file
+
+
+# VAD & Diarization imports
+try:
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.metrics import silhouette_score
+except Exception:
+    pass
+
+try:
+    from speechbrain.inference.speaker import EncoderClassifier
+except Exception:
+    pass
+
+# Global VAD/Diarization models (lazy loaded)
+vad_model = None
+vad_utils = None
+diarization_model = None
+diarization_pipeline = None
+
+class VADDetector:
+    def __init__(self):
+        global vad_model, vad_utils
+        try:
+            # Load Silero VAD from torch hub (force_reload=False to use cache)
+            if vad_model is None:
+                # Use a specific commit/tag for stability if needed, but 'snakers4/silero-vad' is standard.
+                # 'silero_vad' returns model + utils (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks)
+                model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                                              model='silero_vad',
+                                              force_reload=False,
+                                              onnx=False) # Use PyTorch version for simplicity with existing torch
+                vad_model = model
+                vad_utils = utils
+            
+            self.model = vad_model
+            self.utils = vad_utils
+            self.reset()
+            emit({"log": "VAD (Silero) loaded successfully."})
+        except Exception as e:
+            emit({"error": f"Failed to load VAD model: {e}"})
+            self.model = None
+
+    def reset(self):
+        if self.model:
+            self.model.reset_states()
+
+    def is_speech(self, audio_chunk, sr=16000):
+        # 1. Energy Calculation (RMS)
+        # Keep thresholds in int16-equivalent scale even if chunk arrives normalized.
+        if isinstance(audio_chunk, np.ndarray):
+            chunk_np = audio_chunk.astype(np.float32)
+        else:
+            chunk_np = np.asarray(audio_chunk, dtype=np.float32)
+
+        peak = float(np.max(np.abs(chunk_np))) if chunk_np.size else 0.0
+        if peak <= 1.5:
+            rms = float(np.sqrt(np.mean((chunk_np * 32768.0) ** 2)))
+        else:
+            rms = float(np.sqrt(np.mean(chunk_np ** 2)))
+
+        # 2. Hard Silence Gate (Noise Floor)
+        # If it's barely audible noise, ignore it immediately.
+        if rms < 50.0: 
+            return False
+
+        # 3. Energy Bypass (Force Speech)
+        # If the volume is clearly human speech levels (RMS > 300), 
+        # assume it is speech without waiting for the neural model.
+        # This fixes the "missing real-time" issue for normal volumes.
+        if rms > 300.0:
+            return True
+
+        # 4. Neural VAD (Silero) for softer speech (between 50 and 300 RMS)
+        if not self.model:
+            return True # Fallback: if moderate energy and no model, assume speech
+
+        # Prepare for Silero
+        if isinstance(audio_chunk, np.ndarray):
+            audio_float = audio_chunk.astype(np.float32)
+            if np.max(np.abs(audio_float)) > 1.5:
+                audio_float = audio_float / 32768.0
+            audio_chunk = torch.from_numpy(audio_float)
+        
+        if audio_chunk.ndim > 1:
+            audio_chunk = audio_chunk.squeeze()
+        if audio_chunk.ndim == 1:
+            audio_chunk = audio_chunk.unsqueeze(0)
+
+        try:
+            if sr != 16000 and sr != 8000:
+                sr = 16000
+            
+            speech_prob = self.model(audio_chunk, sr).item()
+            # emit({"log": f"VAD Neural Prob: {speech_prob:.2f}"}) # Debug probability
+            return speech_prob > 0.4 # Slightly lower confidence threshold
+        except Exception:
+            return True # Fail open if moderate energy
+
+class DiarizationManager:
+    def __init__(self):
+        self.embeddings = []
+        self.encoder = None
+        self.similarity_threshold = 0.45 # Lower threshold for short segments
+        self.next_speaker_id = 1
+        self.model_source = "speechbrain/spkrec-ecapa-voxceleb"
+        self.lock = threading.Lock()
+        
+        # Async load
+        threading.Thread(target=self._load_model, daemon=True).start()
+
+    def _load_model(self):
+        try:
+            from speechbrain.inference.speaker import EncoderClassifier
+        except Exception as e:
+            emit({"log": f"Diarization: SpeechBrain not available or error: {e}"})
+            return
+
+        try:
+            emit({"log": "Diarization: Loading Speaker Recognition model..."})
+            savedir = project_root() / "python" / "models" / "spkrec-ecapa-voxceleb"
+            savedir.mkdir(parents=True, exist_ok=True)
+            
+            # Use GPU if available
+            run_opts = {"device": "cuda"} if torch.cuda.is_available() else {"device": "cpu"}
+
+            self.encoder = EncoderClassifier.from_hparams(
+                source=self.model_source, 
+                savedir=str(savedir),
+                run_opts=run_opts
+            )
+            emit({"log": "Diarization: Model ready."})
+        except Exception as e:
+            emit({"error": f"Diarization model load failed: {e}"})
+
+    def get_speaker(self, audio_segment, sr=16000):
+        if not self.encoder:
+            return None
+        
+        try:
+            # Convert to torch tensor
+            if isinstance(audio_segment, np.ndarray):
+                waveform = torch.from_numpy(audio_segment.astype(np.float32) / 32768.0)
+            else:
+                waveform = audio_segment
+            
+            if waveform.ndim > 1:
+                waveform = waveform.squeeze()
+            
+            # Length check (ECAPA needs ~0.1s minimum)
+            if waveform.shape[0] < 1600: 
+                return None
+            
+            # Prepare batch (1, N)
+            signal = waveform.unsqueeze(0)
+            if torch.cuda.is_available():
+                signal = signal.to("cuda")
+
+            # Extract embedding
+            embeddings = self.encoder.encode_batch(signal)
+            emb = embeddings.squeeze().cpu()
+            
+            # Compare
+            best_score = -1.0
+            best_id = -1
+            
+            with self.lock:
+                for entry in self.embeddings:
+                    score = torch.nn.functional.cosine_similarity(emb, entry["emb"], dim=0).item()
+                    if score > best_score:
+                        best_score = score
+                        best_id = entry["id"]
+
+                if best_score > self.similarity_threshold:
+                     return f"Hablante {best_id}"
+                else:
+                     new_id = self.next_speaker_id
+                     self.next_speaker_id += 1
+                     self.embeddings.append({"emb": emb, "id": new_id})
+                     return f"Hablante {new_id}"
+
+        except Exception:
+            return None
 
 # Configuration
 CHANNELS = 1
@@ -46,13 +262,14 @@ GRATITUDE_PHRASES = [
 recording = False
 current_recording_id = 0
 audio_queue = queue.Queue()
+transcription_queue = queue.Queue() # New queue for async processing
 selected_device = None
 selected_model = "large-v3-turbo"
 selected_model_dir = ""
 selected_language = "es"
 gpu_enabled = True
-selected_backend = "whispercpp"
-active_backend = "whispercpp"
+selected_backend = "faster-whisper"
+active_backend = "faster-whisper"
 current_stream = None
 model_whisper = None
 loaded_model = ""
@@ -69,9 +286,11 @@ pre_roll_chunks = deque(maxlen=max(1, int((RATE * PRE_ROLL_SECONDS) / CHUNK)))
 pre_roll_lock = threading.Lock()
 
 # Reduce CPU thread pressure to avoid MKL/OMP memory spikes on Windows.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 warnings.filterwarnings("ignore", message=r".*huggingface_hub.*symlinks.*")
 warnings.filterwarnings("ignore", message=r".*HF Hub.*")
@@ -115,8 +334,19 @@ def get_exe_ext() -> str:
     return ".exe" if sys.platform.startswith("win") else ""
 
 
+import ctranslate2
+
 def get_torch_cuda_info() -> dict:
     cuda_available = torch.cuda.is_available()
+    
+    # Fallback: check ctranslate2 if torch returns False (e.g. missing torch_cuda.dll)
+    if not cuda_available:
+        try:
+            if ctranslate2.get_cuda_device_count() > 0:
+                cuda_available = True
+        except Exception:
+            pass
+
     info = {
         "cuda_available": cuda_available,
         "torch_version": getattr(torch, "__version__", "unknown"),
@@ -130,7 +360,8 @@ def get_torch_cuda_info() -> dict:
     try:
         info["gpu_name"] = torch.cuda.get_device_name(0)
     except Exception:
-        info["gpu_name"] = "CUDA GPU"
+        # Try to distinguish if we found it via ctranslate2
+        info["gpu_name"] = "CUDA GPU (Detected)"
 
     try:
         props = torch.cuda.get_device_properties(0)
@@ -163,60 +394,121 @@ def get_whispercpp_executable() -> Path | None:
             return candidate
 
     root = project_root()
+    ext = get_exe_ext()
     
     # Check for bundled resources in freeze/installer mode
+    # Check for bundled resources in freeze/installer mode
     if getattr(sys, 'frozen', False):
-        # In frozen mode, sys.executable is the path to the executable.
-        # Tauri usually places resources in a 'resources' folder next to the executable 
-        # (or in the app root if using sidecar pattern sometimes).
-        # We need to check relative to the executable.
+        # In frozen mode, sys.executable is the path to the executable (e.g., .../resources/audio-engine.exe)
         exe_path = Path(sys.executable).parent
         
-        # Check standard Tauri resources location
-        ext = get_exe_ext()
         candidates = [
+            # Standard Tauri layout: siblings in the same resources folder
+            exe_path / "whispercpp" / f"whisper-cli{ext}",
+            # Flat layout (if tauri flattened resources)
+            exe_path / f"whisper-cli{ext}", 
+            exe_path / "whisper-cli.exe", 
+            exe_path / "whispercpp" / "whisper-cli.exe",
+            
+            exe_path / "whispercpp" / f"main{ext}",
+            # Nested layout: sometimes resources are under a 'resources' subfolder
             exe_path / "resources" / "whispercpp" / f"whisper-cli{ext}",
             exe_path / "resources" / "whispercpp" / f"main{ext}",
-            exe_path / "whispercpp" / f"whisper-cli{ext}",
-            exe_path / "_internal" / "resources" / "whispercpp" / f"whisper-cli{ext}",
-            # Prod layout: audio-engine.exe is in resources/, whispercpp is in resources/whispercpp/
+            # Parent layout: if engine is in a subfolder of resources
             exe_path.parent / "whispercpp" / f"whisper-cli{ext}",
-            exe_path.parent / "whispercpp" / f"main{ext}",
-            # Prod layout (Tauri _up_): audio-engine.exe is in _up_/dist/, resources are in resources/
-            exe_path.parent.parent / "resources" / "whispercpp" / f"whisper-cli{ext}",
-            exe_path.parent.parent / "resources" / "whispercpp" / f"main{ext}",
-            # Dev layout: audio-engine.exe is in dist/, resources are in src-tauri/resources/
-            exe_path.parent / "src-tauri" / "resources" / "whispercpp" / f"whisper-cli{ext}",
-            exe_path.parent / "src-tauri" / "resources" / "whispercpp" / f"main{ext}",
-            # Dev layout (extra parent): handle cases where engine might be nested further
-            exe_path.parent.parent / "src-tauri" / "resources" / "whispercpp" / f"whisper-cli{ext}",
-            exe_path.parent.parent / "src-tauri" / "resources" / "whispercpp" / f"main{ext}",
+            exe_path.parent / "resources" / "whispercpp" / f"whisper-cli{ext}",
+            # App root layout (Windows installer usually flattens or keeps structure)
+            exe_path.parent / "resources" / "whispercpp" / f"whisper-cli{ext}",
+            exe_path / f"whisper-cli{ext}", # Sibling check
+            exe_path / "whisper-cli.exe", 
         ]
-
         
-        for candidate in candidates:
-            if candidate.exists() and candidate.is_file():
-                return candidate
-                
+        emit({"log": f"Frozen mode detected. Sys.exe: {sys.executable}. Exe path: {exe_path}"})
+        logging.info(f"Frozen mode detected. Sys.exe: {sys.executable}")
+        logging.info(f"Exe path: {exe_path}")
+
+        try:
+             # Listing directories for debug
+             if exe_path.exists():
+                 logging.info(f"Directory contents of {exe_path}: {os.listdir(exe_path)}")
+             if (exe_path / "whispercpp").exists():
+                 logging.info(f"Contents of whispercpp subdir: {os.listdir(exe_path / 'whispercpp')}")
+        except Exception as e:
+             logging.error(f"Failed to list directory: {e}")
+
+    else:
+        # Dev mode
+        exe_path = project_root()
+        candidates = [
+            project_root() / "src-tauri" / "resources" / "whispercpp" / f"whisper-cli{ext}",
+            project_root() / "src-tauri" / "resources" / "whispercpp" / "main.exe",
+             # Also check relative to script if distinct
+            Path(__file__).parent.parent / "src-tauri" / "resources" / "whispercpp" / f"whisper-cli{ext}"
+        ]
+        logging.info(f"Dev mode detected. Exe path (root): {exe_path}")
+
+    # 1. Standard candidates check
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            logging.info(f"Found whispercpp (standard) at: {candidate}")
+            return candidate
+
+    # 2. Recursive search in resources or parent directories
+    # This handles unexpected flattening or nesting by Tauri
+    try:
+        logging.info("Standard paths failed. Attempting recursive search...")
+        
+        # Define search roots: current dir, parent, and potential resource dirs
+        search_roots = [exe_path]
+        if exe_path.parent != exe_path:
+            search_roots.append(exe_path.parent)
+            
+        # Add common 'resources' or '_up_' paths seen in Tauri
+        extras = ["resources", "_up_", "dist"]
+        for extra in extras:
+            if (exe_path / extra).exists(): search_roots.append(exe_path / extra)
+            if (exe_path.parent / extra).exists(): search_roots.append(exe_path.parent / extra)
+        
+        # Deduplicate
+        search_roots = list(set(search_roots))
+        
+        for root in search_roots:
+            if not root.exists(): continue
+            logging.info(f"Searching root: {root}")
+            # Walk the tree
+            for dirpath, dirnames, filenames in os.walk(root):
+                if f"whisper-cli{ext}" in filenames:
+                    found = Path(dirpath) / f"whisper-cli{ext}"
+                    logging.info(f"Found whispercpp via walk at: {found}")
+                    return found
+                    
+    except Exception as e:
+         logging.error(f"Recursive search failed: {e}")
+            
+    # Dev and general search candidates (fallback)
     candidates = [
-        # Dev paths
-        root / "src-tauri" / "resources" / "whispercpp" / f"whisper-cli{get_exe_ext()}",
-        root / "src-tauri" / "resources" / "whispercpp" / f"main{get_exe_ext()}",
-        # Legacy paths
-        Path(f"C:/wsp/build/bin/Release/whisper-cli{get_exe_ext()}"),
-        Path(f"C:/wsp/build/bin/Release/main{get_exe_ext()}"),
-        root / "python" / "whispercpp" / f"whisper-cli{get_exe_ext()}",
-        root / "python" / "whispercpp" / f"main{get_exe_ext()}",
-        root / "python" / "whispercpp" / "build" / "bin" / "Release" / f"whisper-cli{get_exe_ext()}",
-        root / "python" / "whispercpp" / "build" / "bin" / "Release" / f"main{get_exe_ext()}",
-        root / "whispercpp" / "build" / "bin" / "Release" / f"whisper-cli{get_exe_ext()}",
-        root / "whispercpp" / "build" / "bin" / "Release" / f"main{get_exe_ext()}",
+        # Dev layout (from project root)
+        root / "src-tauri" / "resources" / "whispercpp" / f"whisper-cli{ext}",
+        root / "src-tauri" / "resources" / "whispercpp" / f"main{ext}",
+        # Resource folder next to script
+        root / "resources" / "whispercpp" / f"whisper-cli{ext}",
+        # Known legacy/custom paths
+        Path(f"C:/wsp/build/bin/Release/whisper-cli{ext}"),
+        root / "python" / "whispercpp" / f"whisper-cli{ext}",
+        root / "whispercpp" / "build" / "bin" / "Release" / f"whisper-cli{ext}",
     ]
+
+    logging.info(f"[DEBUG PATHS] Project Root: {root}")
+    # logging.info(f"[DEBUG PATHS] Checking candidates: {[str(c) for c in candidates]}")
 
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
+            logging.info(f"Found whispercpp (dev fallback) at: {candidate}")
             return candidate
+        else:
+            logging.info(f"[DEBUG PATHS] Not found: {candidate}")
 
+    logging.error(f"Could not find whisper-cli.exe. Searched standardized and recursive locations.")
     return None
 
 
@@ -234,17 +526,24 @@ def get_whispercpp_server_executable() -> Path | None:
             return server_from_cli
 
     root = project_root()
+    ext = get_exe_ext()
+    
     candidates = [
-        Path(f"C:/wsp/build/bin/Release/whisper-server{get_exe_ext()}"),
-        root / "python" / "whispercpp" / f"whisper-server{get_exe_ext()}",
-        root / "python" / "whispercpp" / "build" / "bin" / "Release" / f"whisper-server{get_exe_ext()}",
-        root / "whispercpp" / "build" / "bin" / "Release" / f"whisper-server{get_exe_ext()}",
+        # Dev paths
+        root / "src-tauri" / "resources" / "whispercpp" / f"whisper-server{ext}",
+        # Legacy/Custom
+        Path(f"C:/wsp/build/bin/Release/whisper-server{ext}"),
+        root / "python" / "whispercpp" / f"whisper-server{ext}",
+        root / "whispercpp" / "build" / "bin" / "Release" / f"whisper-server{ext}",
     ]
 
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
+            emit({"log": f"Found whispercpp at: {candidate}"})
             return candidate
 
+    emit({"error": f"Could not find whisper-cli.exe. Searched {len(candidates)} locations."})
+    emit({"log": f"Search paths included: {[str(c) for c in candidates]}"})
     return None
 
 
@@ -323,6 +622,18 @@ def stop_whisper_server():
     whisper_server_process = None
     whisper_server_model_path = ""
 
+atexit.register(stop_whisper_server)
+
+def handle_sigterm(signum, frame):
+    stop_whisper_server()
+    os._exit(0)
+
+try:
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+except Exception:
+    pass
+
 
 def _whisper_server_log_listener(process):
     """Thread to read whisper-server stderr and filter/emit logs."""
@@ -378,16 +689,26 @@ def _whisper_server_log_listener(process):
 
 def ensure_whisper_server(model_path: str, prefer_gpu: bool) -> tuple[bool, str]:
     global whisper_server_process, whisper_server_model_path
+    emit({"log": f"Ensuring whisper-server is running for model: {model_path}"})
 
     server_exe = get_whispercpp_server_executable()
     if server_exe is None:
+        emit({"error": "whisper-server.exe not found"})
         return False, "No se encontró whisper-server.exe"
+
+    # Ensure model exists (download if needed)
+    emit({"log": f"Verifying model file: {model_path}"})
+    downloaded_path = ensure_model_exists(selected_model)
+    if downloaded_path:
+        model_path = downloaded_path
 
     with whisper_server_lock:
         if whisper_server_process is not None and whisper_server_process.poll() is None and is_whisper_server_ready():
             if whisper_server_model_path == model_path:
+                emit({"log": "whisper-server is already running with the correct model"})
                 return True, ""
 
+            emit({"log": f"Switching whisper-server to model: {model_path}"})
             try:
                 base, _, _ = whisper_server_urls()
                 status, _ = http_post_multipart(
@@ -398,11 +719,13 @@ def ensure_whisper_server(model_path: str, prefer_gpu: bool) -> tuple[bool, str]
                 if status == 200:
                     whisper_server_model_path = model_path
                     return True, ""
-            except Exception:
+            except Exception as e:
+                emit({"log": f"Failed to switch model, restarting server: {e}"})
                 stop_whisper_server()
 
         stop_whisper_server()
 
+        cpu_threads = min(os.cpu_count() or 4, 8)
         command = [
             str(server_exe),
             "--host",
@@ -411,14 +734,16 @@ def ensure_whisper_server(model_path: str, prefer_gpu: bool) -> tuple[bool, str]
             str(WHISPERCPP_SERVER_PORT),
             "-m",
             model_path,
-            "-nt",
+            "-nt",           # no timestamps (faster)
+            "-t", str(cpu_threads),  # CPU threads
+            "--beam-size", "1",      # greedy decoding (fastest)
         ]
-        if not prefer_gpu:
+        if prefer_gpu:
+            command += ["-ngl", "99"]  # offload all layers to GPU
+        else:
             command.append("-ng")
         
-        # Diagnostic print
-        # print(f"DEBUG: Starting whisper-server with command: {' '.join(command)}")
-        # print(f"DEBUG: Prefer GPU is {prefer_gpu}")
+        emit({"log": f"Starting whisper-server: {' '.join(command)}"})
 
         try:
             whisper_server_process = subprocess.Popen(
@@ -431,23 +756,38 @@ def ensure_whisper_server(model_path: str, prefer_gpu: bool) -> tuple[bool, str]
             threading.Thread(target=_whisper_server_log_listener, args=(whisper_server_process,), daemon=True).start()
         except Exception as e:
             whisper_server_process = None
+            emit({"error": f"Failed to spawn whisper-server: {e}"})
             return False, f"No se pudo iniciar whisper-server: {e}"
 
         started_at = time.time()
         while (time.time() - started_at) < WHISPERCPP_SERVER_HEALTH_TIMEOUT:
             if whisper_server_process.poll() is not None:
                 whisper_server_process = None
+                emit({"error": "whisper-server terminated unexpectedly during startup"})
                 return False, "whisper-server terminó inesperadamente al iniciar"
 
             if is_whisper_server_ready():
                 whisper_server_model_path = model_path
+                emit({"log": "whisper-server is ready"})
                 return True, ""
 
             time.sleep(0.3)
 
         stop_whisper_server()
+        emit({"error": "whisper-server health check timeout"})
         return False, "Timeout iniciando whisper-server"
 
+
+def get_app_data_dir() -> Path:
+    if sys.platform == "win32":
+        return Path(os.environ["APPDATA"]) / "Veloce"
+    elif sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Veloce"
+    else:
+        return Path.home() / ".config" / "veloce"
+
+def get_writable_models_dir() -> Path:
+    return get_app_data_dir() / "models"
 
 def get_whispercpp_model_dir() -> Path:
     if selected_model_dir:
@@ -457,46 +797,39 @@ def get_whispercpp_model_dir() -> Path:
     if env_dir:
         return Path(env_dir)
 
+    # 1. Check user-writable AppData location (Priority for downloaded models)
+    writable_dir = get_writable_models_dir()
+    if writable_dir.exists() and writable_dir.is_dir():
+        # Only return if it actually has bin/gguf files to avoid empty dirs
+        if any(writable_dir.glob("*.bin")) or any(writable_dir.glob("*.gguf")):
+            return writable_dir
+
     root = project_root()
 
     # Check for bundled resources in freeze/installer mode
     if getattr(sys, 'frozen', False):
         exe_path = Path(sys.executable).parent
-        # Check standard Tauri resources location
-        candidate = exe_path / "resources" / "models"
-        if candidate.exists() and candidate.is_dir():
-             return candidate
         
-        # Fallback/Other structures
-        candidate = exe_path / "models"
-        if candidate.exists() and candidate.is_dir():
-             return candidate
-
-        # Prod layout: audio-engine.exe is in resources/, models are in resources/models/
-        candidate = exe_path.parent / "models"
-        if candidate.exists() and candidate.is_dir():
-             return candidate
-
-        # Prod layout (Tauri _up_): audio-engine.exe is in _up_/dist/, models are in resources/models/
-        candidate = exe_path.parent.parent / "resources" / "models"
-        if candidate.exists() and candidate.is_dir():
-             return candidate
-
-        # Dev layout: audio-engine.exe is in dist/, models are in src-tauri/resources/models/
-        candidate = exe_path.parent / "src-tauri" / "resources" / "models"
-        if candidate.exists() and candidate.is_dir():
-             return candidate
-
-        candidate = exe_path.parent.parent / "src-tauri" / "resources" / "models"
-        if candidate.exists() and candidate.is_dir():
-             return candidate
+        candidates = [
+            # Standard Tauri layout: models are siblings to audio-engine.exe
+            exe_path / "models",
+            # Nested layout: resources/models
+            exe_path / "resources" / "models",
+            # Parent layout
+            exe_path.parent / "models",
+            exe_path.parent / "resources" / "models",
+        ]
+        
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_dir():
+                return candidate
 
     candidates = [
+        writable_dir,
         root / "src-tauri" / "resources" / "models",
+        root / "models",
         Path("C:/wsp/models"),
         root / "python" / "whispercpp" / "models",
-        root / "whispercpp" / "models",
-        root / "models",
     ]
 
     for candidate in candidates:
@@ -504,6 +837,68 @@ def get_whispercpp_model_dir() -> Path:
             return candidate
 
     return candidates[0]
+
+def download_file(url, dest_path):
+    emit({"log": f"Descargando modelo desde {url}..."})
+    try:
+        # Stream download with progress
+        with urllib.request.urlopen(url) as response:
+            total_size = int(response.info().get('Content-Length').strip())
+            downloaded = 0
+            chunk_size = 1024 * 1024 # 1MB chunks
+            
+            with open(dest_path, 'wb') as out_file:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+                    downloaded += len(chunk)
+                    # Optional: Emit percentage if needed, but logging "downloading..." is often enough
+                    # percent = int(downloaded / total_size * 100)
+                    # if percent % 10 == 0: ...
+        
+        emit({"log": "Descarga de modelo completada."})
+    except Exception as e:
+        emit({"error": f"Error descargando modelo: {e}"})
+        # Clean up partial
+        if dest_path.exists():
+            os.remove(dest_path)
+        raise
+
+def ensure_model_exists(model_name: str) -> str:
+    # 1. Check if already exists
+    model_file, resolved_name = find_whispercpp_model_file(model_name)
+    if model_file and model_file.exists():
+        return str(model_file)
+    
+    # 2. If not, verify if it's the default/supported one we can download
+    if model_name not in ["large-v3-turbo", "ggml-large-v3-turbo"]:
+        emit({"log": f"Modelo '{model_name}' no encontrado. No hay descarga automática para este modelo."})
+        return ""
+
+    # 3. Download
+    target_dir = get_writable_models_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    
+    filename = "ggml-large-v3-turbo.bin"
+    target_path = target_dir / filename
+    
+    url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+    
+    emit({"log": f"Modelo no encontrado. Iniciando descarga automática a {target_path}..."})
+    
+    # Use a lock to prevent parallel downloads
+    with download_lock:
+        if target_path.exists():
+             return str(target_path)
+             
+        try:
+            download_file(url, target_path)
+            return str(target_path)
+        except Exception as e:
+            emit({"error": f"Fallo la descarga del modelo: {e}"})
+            return ""
 
 
 def whispercpp_model_keys(model_name: str) -> list[str]:
@@ -584,6 +979,7 @@ def find_whispercpp_model_file(model_name: str) -> tuple[Path | None, str]:
 
 def get_whispercpp_status(model_name: str) -> dict:
     executable = get_whispercpp_executable()
+    emit({"log": f"get_whispercpp_status: exec={executable}"})
     model_file, resolved_model = find_whispercpp_model_file(model_name)
     available = executable is not None and model_file is not None
 
@@ -638,8 +1034,18 @@ def resolve_backend(model_name: str, prefer_gpu: bool, backend_name: str) -> str
 
 
 def emit(payload):
-    print(json.dumps(payload))
+    msg = json.dumps(payload)
+    print(msg)
     sys.stdout.flush()
+    # Log to file as well
+    if "error" in payload:
+        logging.error(f"EMIT ERROR: {payload['error']}")
+    elif "log" in payload:
+        logging.info(f"EMIT LOG: {payload['log']}")
+    elif "status" in payload:
+        logging.debug(f"EMIT STATUS: {payload['status']}")
+    elif "transcription" in payload:
+        logging.info(f"EMIT TRANSCRIPTION ({payload.get('is_final')}): {payload['transcription']}")
 
 
 def has_valid_model_snapshot(repo_dir: Path) -> bool:
@@ -678,10 +1084,10 @@ def get_downloaded_models():
         candidates.insert(0, Path(hf_home) / "hub")
     
     cache_dir = next((p for p in candidates if p.exists()), None)
-    if cache_dir is None:
-        return []
-
-    supported_set = set(SUPPORTED_MODELS)
+    
+    # Also scan custom model dir if set
+    custom_dir = get_whispercpp_model_dir()
+    
     repo_to_model = {
         "models--Systran--faster-whisper-tiny": "tiny",
         "models--Systran--faster-whisper-base": "base",
@@ -694,26 +1100,59 @@ def get_downloaded_models():
         "models--mistralai--Voxtral-Mini-4B-Realtime-2602": "voxtral-mini-4b-realtime-2602",
     }
     
-    try:
-        for item in cache_dir.iterdir():
-            if not item.is_dir():
-                continue
+    # Scan HF Cache
+    if cache_dir:
+        try:
+            for item in cache_dir.iterdir():
+                if not item.is_dir():
+                    continue
 
-            model_name = repo_to_model.get(item.name)
-            if not model_name and item.name.startswith("models--Systran--faster-whisper-"):
-                model_name = item.name.replace("models--Systran--faster-whisper-", "")
+                model_name = repo_to_model.get(item.name)
+                if not model_name and item.name.startswith("models--Systran--faster-whisper-"):
+                    model_name = item.name.replace("models--Systran--faster-whisper-", "")
 
-            if model_name and model_name in supported_set and has_valid_model_snapshot(item):
-                models.append({
-                    "id": model_name,
-                    "name": model_name.replace("-", " ").title(),
-                    "downloaded": True
-                })
-    except Exception:
-        pass
+                if model_name and model_name in SUPPORTED_MODELS and has_valid_model_snapshot(item):
+                    # Calculate size
+                    size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
+                    models.append({
+                        "id": model_name,
+                        "name": model_name.replace("-", " ").title(),
+                        "downloaded": True,
+                        "path": str(item),
+                        "size": size,
+                        "source": "huggingface"
+                    })
+        except Exception:
+            pass
 
-    models.sort(key=lambda model: model["id"])
-    return models
+    # Scan Custom/Local Dir (whisper.cpp style or direct faster-whisper dumps)
+    if custom_dir and custom_dir.exists():
+        try:
+            for f in custom_dir.iterdir():
+                if f.is_file() and (f.suffix == '.bin' or f.suffix == '.gguf'):
+                    # Check if it matches a known model ID
+                    model_id = infer_model_from_whispercpp_filename(f)
+                    if model_id:
+                        models.append({
+                            "id": model_id,
+                            "name": model_id.replace("-", " ").title(),
+                            "downloaded": True,
+                            "path": str(f),
+                            "size": f.stat().st_size,
+                            "source": "local"
+                        })
+        except Exception:
+            pass
+
+    unique_models = {}
+    for m in models:
+        if m["id"] not in unique_models:
+             unique_models[m["id"]] = m
+        else:
+             # If duplicate, maybe prefer one with path or larger size?
+             pass
+
+    return list(unique_models.values())
 
 
 def get_model_directory_options() -> list[str]:
@@ -760,15 +1199,32 @@ def get_model_directory_options() -> list[str]:
 def get_hardware_info():
     """Fetch available microphones and GPU status."""
     global selected_backend, active_backend
+    emit({"log": "Querying hardware info..."})
     devices = []
     try:
+        # Reset portaudio cache to detect newly plugged-in mics
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+
         all_devices = sd.query_devices()
+        emit({"log": f"Found {len(all_devices)} audio devices"})
         default_device = sd.default.device
         default_input = default_device[0] if isinstance(default_device, (list, tuple)) else None
+        
+        seen_names = set()
         
         for i, dev in enumerate(all_devices):
             if dev.get('max_input_channels', 0) > 0:
                 name = dev.get('name', f"Device {i}")
+                
+                # Check for exact duplicates
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+
                 if i == default_input:
                     name = f"{name} (Default)"
                     
@@ -778,6 +1234,7 @@ def get_hardware_info():
                     "host_api": dev.get('hostapi')
                 })
     except Exception as e:
+        emit({"error": f"Error querying audio devices: {e}"})
         devices = [{"id": -1, "name": f"Error: {e}", "host_api": -1}]
     
     cuda_info = get_torch_cuda_info()
@@ -830,12 +1287,13 @@ def get_hardware_info():
         model_file, _ = find_whispercpp_model_file(model_entry["id"])
         if model_file is not None:
             model_entry["downloaded"] = True
+            model_entry["path"] = str(model_file)
 
     merged_models = {m["id"]: m for m in fallback_models}
     for model in models:
         merged_models[model["id"]] = model
     
-    return {
+    info = {
         "type": "hardware-info",
         "microphones": devices,
         "gpu": {
@@ -871,6 +1329,8 @@ def get_hardware_info():
         "model_dirs": get_model_directory_options(),
         "default_model_dir": str(get_whispercpp_model_dir()),
     }
+    emit({"log": f"Hardware info: {len(devices)} mics, GPU={gpu_available}, {len(info['models'])} models"})
+    return info
 
 
 def load_whisper(model_name, prefer_gpu):
@@ -883,7 +1343,7 @@ def load_whisper(model_name, prefer_gpu):
 
     vram = cuda_info.get("vram_gb")
     vram_text = f", vram_gb={vram}" if isinstance(vram, (int, float)) else ""
-    emit({"log": f"faster-whisper runtime: device={device}, compute_type={compute_type}, reason={runtime_reason}, prefer_gpu={prefer_gpu}, cuda_available={cuda_info['cuda_available']}, torch={cuda_info['torch_version']}, gpu={cuda_info['gpu_name']}{vram_text}"})
+    # emit({"log": f"faster-whisper runtime: device={device}, compute_type={compute_type}, reason={runtime_reason}, prefer_gpu={prefer_gpu}, cuda_available={cuda_info['cuda_available']}, torch={cuda_info['torch_version']}, gpu={cuda_info['gpu_name']}{vram_text}"})
 
     emit({"status": "loading_model"})
 
@@ -901,8 +1361,9 @@ def load_whisper(model_name, prefer_gpu):
         loaded = WhisperModel(model_name, device=device, compute_type=compute_type)
         with model_lock:
             model_whisper = loaded
+        load_uuid = str(uuid.uuid4())[:6]
         emit({"status": "ready"})
-        emit({"log": f"Model loaded: {model_name} on {device}"})
+        emit({"log": f"Model loaded [{load_uuid}]: {model_name} on {device}"})
         return model_name
     except Exception as e:
         emit({"error": f"Whisper Load Error ({model_name}): {e}"})
@@ -930,14 +1391,14 @@ def load_backend(model_name, prefer_gpu, backend_name):
     with backend_load_lock:
         requested_backend = resolve_backend(model_name, prefer_gpu, backend_name)
         
-        # Avoid redundant reloads
+        # Avoid redundant reloads — compare by actual assigned backend type to prevent infinite fallback loops
+        # This prevents infinite loops when a fallback occurs (e.g., whispercpp -> faster-whisper)
         if (loaded_model == model_name and 
             loaded_gpu == prefer_gpu and 
             loaded_backend_type == backend_name and 
-            active_backend == requested_backend and 
             active_backend != "none"):
             
-            # Additional check for whispercpp server health
+            # Additional check for backend health
             if active_backend == "whispercpp" and is_whisper_server_ready():
                  emit({"status": "ready"})
                  return model_name
@@ -947,50 +1408,67 @@ def load_backend(model_name, prefer_gpu, backend_name):
 
         chosen_backend = requested_backend
 
-    if chosen_backend == "whispercpp":
-        emit({"status": "loading_model"})
+        if chosen_backend == "whispercpp":
+            emit({"status": "loading_model"})
+            emit({"log": "Switching to whisper.cpp backend"})
 
-        with model_lock:
-            previous_model = model_whisper
-            model_whisper = None
+            with model_lock:
+                previous_model = model_whisper
+                model_whisper = None
 
-        if previous_model is not None:
-            del previous_model
-            gc.collect()
+            if previous_model is not None:
+                emit({"log": "Unloading faster-whisper model from memory"})
+                del previous_model
+                gc.collect()
 
-        status = get_whispercpp_status(model_name)
-        if not status["available"]:
-            emit({"error": f"whisper.cpp no disponible: {status['reason']}"})
-            active_model = load_whisper(model_name, prefer_gpu)
-            active_backend = "faster-whisper" if active_model else "none"
-            return active_model
+            status = get_whispercpp_status(model_name)
+            if not status["available"]:
+                emit({"log": f"whisper.cpp not available, falling back to faster-whisper: {status['reason']}"})
+                active_model = load_whisper(model_name, prefer_gpu)
+                if active_model:
+                    active_backend = "faster-whisper"
+                    loaded_model = model_name
+                    loaded_gpu = prefer_gpu
+                    loaded_backend_type = backend_name # We requested this, so we cache it as processed to avoid retry loop
+                else:
+                    active_backend = "none"
+                return active_model
 
-        resolved_model = status.get("resolved_model") or model_name
-        model_path = status.get("model_path", "")
-        ready, error = ensure_whisper_server(model_path, prefer_gpu)
-        if not ready:
-            emit({"error": f"No se pudo inicializar whisper-server: {error}"})
-            active_model = load_whisper(model_name, prefer_gpu)
-            active_backend = "faster-whisper" if active_model else "none"
-            return active_model
+            resolved_model = status.get("resolved_model") or model_name
+            model_path = status.get("model_path", "")
+            emit({"log": f"Ensuring whisper-server for {resolved_model} at {model_path}"})
+            ready, error = ensure_whisper_server(model_path, prefer_gpu)
+            if not ready:
+                emit({"error": f"Failed to initialize whisper-server: {error}"})
+                emit({"log": "Falling back to faster-whisper after whisper-server failure"})
+                active_model = load_whisper(model_name, prefer_gpu)
+                if active_model:
+                    active_backend = "faster-whisper"
+                    loaded_model = model_name
+                    loaded_gpu = prefer_gpu
+                    loaded_backend_type = backend_name 
+                else:
+                    active_backend = "none"
+                return active_model
 
-        active_backend = "whispercpp"
-        loaded_model = model_name
-        loaded_gpu = prefer_gpu
-        loaded_backend_type = backend_name
-        emit({"status": "ready"})
-        emit({"log": f"Model ready: {resolved_model} on whisper.cpp server ({model_path})"})
-        return resolved_model
+            active_backend = "whispercpp"
+            loaded_model = model_name
+            loaded_gpu = prefer_gpu
+            loaded_backend_type = backend_name
+            emit({"status": "ready"})
+            emit({"log": f"Model ready: {resolved_model} on whisper.cpp server ({model_path})"})
+            return resolved_model
 
-    active_backend = "faster-whisper"
-    active_model = load_whisper(model_name, prefer_gpu)
-    if active_model:
-        loaded_model = model_name
-        loaded_gpu = prefer_gpu
-        loaded_backend_type = backend_name
-    else:
-        active_backend = "none"
-    return active_model
+        emit({"log": "Using faster-whisper backend"})
+        active_backend = "faster-whisper"
+        active_model = load_whisper(model_name, prefer_gpu)
+        if active_model:
+            loaded_model = model_name
+            loaded_gpu = prefer_gpu
+            loaded_backend_type = backend_name
+        else:
+            active_backend = "none"
+        return active_model
 
 
 def load_backend_async(model_name, prefer_gpu, backend_name):
@@ -998,11 +1476,13 @@ def load_backend_async(model_name, prefer_gpu, backend_name):
         active_model = load_backend(model_name, prefer_gpu, backend_name)
         if active_model and active_model != model_name:
             emit({"log": f"Active model adjusted to: {active_model}"})
+        # Emit hardware info AFTER loading completes to sync frontend state correctly
+        emit(get_hardware_info())
 
     threading.Thread(target=_run, daemon=True).start()
 
 
-def download_model_to_cache(model_name):
+def download_model_to_cache(model_name, download_dir=None):
     if not download_lock.acquire(blocking=False):
         emit({"error": "Another model download is already in progress"})
         return
@@ -1029,9 +1509,17 @@ def download_model_to_cache(model_name):
                     def _emit_progress(self):
                         if self.total and self.total > 0:
                             progress = int((self.n / self.total) * 100)
-                            if progress != self._last_progress:
+                            # Emit if progress changed or every 1MB chunk to keep alive
+                            if progress != self._last_progress or (self.n % (1024*1024) == 0):
                                 self._last_progress = progress
-                                emit({"type": "model-download-progress", "model": model_name, "progress": progress})
+                                emit({
+                                    "type": "model-download-progress", 
+                                    "model": model_name, 
+                                    "progress": progress,
+                                    "loaded": self.n,
+                                    "total": self.total,
+                                    "unit": self.unit if hasattr(self, 'unit') else 'B'
+                                })
 
                     def update(self, n=1):
                         result = super().update(n)
@@ -1043,9 +1531,13 @@ def download_model_to_cache(model_name):
                         self._emit_progress()
                         return result
 
+                # Determine where to download
+                local_dir_arg = download_dir if download_dir else None
+
                 snapshot_download(
                     repo_id=repo_id,
                     repo_type="model",
+                    local_dir=local_dir_arg,
                     local_files_only=False,
                     max_workers=1,
                     tqdm_class=EmitTqdm,
@@ -1066,7 +1558,10 @@ def download_model_to_cache(model_name):
         emit({"log": f"Model downloaded: {model_name}"})
 
         downloaded_now = any(model.get("id") == model_name and model.get("downloaded", False) for model in get_hardware_info().get("models", []))
-        if downloaded_now:
+        
+        # If we downloaded to a custom path that isn't in standard search, downloaded_now might be false,
+        # but the operation was successful.
+        if downloaded_now or download_dir: 
             emit({"log": f"Download verification passed: {model_name}"})
             if model_name == selected_model:
                 active_model = load_backend(selected_model, gpu_enabled, selected_backend)
@@ -1086,8 +1581,10 @@ def start_input_stream(device_id, force_restart=False):
     global current_stream
 
     def audio_callback(indata, frames, callback_time, status):
+        # DO NOT RETURN ON STATUS. It often just means input overflow/underflow.
+        # Dropping audio here causes the engine to "freeze" listening.
         if status:
-            return
+            pass # We could log it, but it might spam on certain hardware.
         chunk = indata.copy()
         with pre_roll_lock:
             pre_roll_chunks.append(chunk)
@@ -1125,53 +1622,320 @@ def inject_pre_roll_audio():
     for chunk in chunks:
         audio_queue.put(chunk)
 
+class StreamProcessor:
+    def __init__(self, vad_detector, sample_rate=16000, chunk_size=512):
+        self.vad = vad_detector
+        self.sample_rate = sample_rate
+        self.chunk_size = chunk_size
+        
+        self.speech_buffer = []
+        self.is_speech_active = False
+        self.speech_start_time = 0
+        self.last_speech_time = 0
+        self.silence_counter = 0
+        
+        # Tuning parameters
+        self.min_speech_duration_ms = 150 # Reduced to catch short words like "Hi"
+        self.min_silence_duration_ms = 1200  # Increased to prevent micro-fragmentation
+        self.speech_pad_ms = 100  
+        
+        self.accumulated_audio_duration = 0
+        self.last_partial_time = 0
+        
+        # We no longer keep pending segments, we dispatch them immediately
+        # self.pending_segments = []
+
+    def process(self, audio_chunk):
+        # audio_chunk: numpy array (int16 or float32)
+
+        is_speech_frame = self.vad.is_speech(audio_chunk, self.sample_rate)
+        
+        if is_speech_frame:
+            self.silence_counter = 0
+            if not self.is_speech_active:
+                self.is_speech_active = True
+                self.speech_start_time = time.time()
+                # emit({"log": "VAD: Speech detected (Active)"}) # Debug Log
+                # emit({"status": "speech_start"}) # Optional reduce noise
+        else:
+            if self.is_speech_active:
+                self.silence_counter += (len(audio_chunk) / self.sample_rate) * 1000
+        
+        # Determine state transition
+        if self.is_speech_active:
+            self.speech_buffer.append(audio_chunk)
+            self.accumulated_audio_duration += len(audio_chunk) / self.sample_rate
+            
+            # Check for silence timeout -> Finalize
+            if self.silence_counter > self.min_silence_duration_ms:
+                self.finalize_segment()
+                self.is_speech_active = False
+                self.silence_counter = 0
+            # If speaking continuously for a while, emit a partial update to reduce perceived latency
+            elif self.accumulated_audio_duration - self.last_partial_time > 1.5:
+                self.last_partial_time = self.accumulated_audio_duration
+                self._transcribe_partial()
+
+    def finalize_segment(self, is_final_flush=False):
+        if not self.speech_buffer:
+            return
+            
+        full_audio = np.concatenate(self.speech_buffer)
+        duration = len(full_audio) / self.sample_rate
+        
+        if duration * 1000 < self.min_speech_duration_ms:
+            # Too short, ignore but send an empty final to reset the UI waiting state
+            transcription_queue.put({
+                "audio": np.zeros((1,), dtype=np.int16),
+                "is_final": True,
+                "is_empty_drop": True
+            })
+            self.speech_buffer = []
+            self.accumulated_audio_duration = 0
+            self.last_partial_time = 0
+            return
+            
+        # Dispatch immediately to background worker
+        transcription_queue.put({
+            "audio": full_audio,
+            "is_final": True
+        })
+        
+        if is_final_flush:
+            self.speech_buffer = []
+        else:
+            # Ovelap: keep the last 1.5 seconds of audio to give whisper context for the next phrase
+            overlap_seconds = 1.5
+            overlap_samples = int(overlap_seconds * self.sample_rate)
+            if len(full_audio) > overlap_samples:
+                overlap_audio = full_audio[-overlap_samples:]
+                # Reconstruct buffer from the overlap
+                self.speech_buffer = []
+                for i in range(0, len(overlap_audio), self.chunk_size):
+                    chunk = overlap_audio[i:i+self.chunk_size]
+                    if len(chunk) == self.chunk_size:
+                        self.speech_buffer.append(chunk)
+            else:
+                self.speech_buffer = []
+            
+        self.accumulated_audio_duration = 0
+        self.last_partial_time = 0
+        
+        # if recording:
+        #     emit({"status": "listening"}) 
+
+    def transcribe_all_pending(self):
+        # Flush whatever is in the speech buffer right now as final
+        if self.speech_buffer:
+            self.finalize_segment(is_final_flush=True)
+
+    def _transcribe_partial(self):
+        if not self.speech_buffer:
+            return
+        # Take a copy to avoid threading issues if buffer changes during async call
+        # (though Python GIL usually protects basic list ops, concatenation is safer)
+        current_audio = np.concatenate(self.speech_buffer)
+        
+        # Run in thread to not block audio processing loop
+        # We don't put partials in the queue to avoid blocking finals
+        threading.Thread(target=transcribe_segment, args=(current_audio, False), daemon=True).start()
+
+def transcribe_segment(audio_data, is_final=False):
+    # This replaces the old transcribe() function logic but adapted
+    global current_recording_id, diarization_manager
+    
+    # Flatten if needed
+    if audio_data.ndim > 1:
+        audio_data = audio_data.flatten()
+
+    chunk_duration_s = float(audio_data.size) / float(RATE)
+    
+    # Determine speaker only on final segments to save compute
+    speaker_label = None
+    if is_final and diarization_manager:
+        try:
+             # Basic check to avoid errors if diarization is not ready
+             # speaker_label = diarization_manager.get_speaker(audio_data)
+             pass
+        except Exception:
+             pass
+
+    if active_backend == "whispercpp":
+        # whisper.cpp streaming via server is tricky for partials without active state maintenance
+        # but we can just send the growing buffer for now.
+        start_time = time.time()
+        text, error = transcribe_whispercpp(audio_data, selected_language, is_final=is_final)
+        latency_ms = (time.time() - start_time) * 1000
+        if error:
+            emit({"error": error})
+            return
+        
+        # Cleanup
+        # Cleanup
+        text = cleanup_transcription_text(text, chunk_duration_s)
+        
+        if text:
+            emit({
+                "transcription": text, 
+                "is_final": is_final, 
+                "recording_id": current_recording_id,
+                "speaker": speaker_label,
+                "response_ms": int(latency_ms)
+            })
+        return
+
+    # faster-whisper flow
+    audio_float32 = audio_data.astype(np.float32) / 32768.0
+    
+    # Normalization (light)
+    audio_float32 = audio_float32 - float(np.mean(audio_float32))
+    peak = float(np.max(np.abs(audio_float32)))
+    if peak > 0:
+        audio_float32 = audio_float32 / peak * 0.95
+
+    with model_lock:
+        model = model_whisper
+    
+    if model is None:
+        return
+
+    try:
+        # Auto-switch to translation task if target is English (common use case for translation)
+        # This helps real-time translation for non-English speakers selecting English.
+        effective_task = "translate" if selected_language == "en" else "transcribe"
+
+        start_time = time.time()
+        segments, _ = model.transcribe(
+            audio_float32,
+            beam_size=1, # Faster for partials
+            best_of=1,
+            condition_on_previous_text=True, # Allow context to flow across chunks
+            vad_filter=False, # We already did VAD, don't let whisper's internal VAD filter out partials
+            language=None if selected_language == "auto" else selected_language,
+            task=effective_task
+        )
+        
+        text = " ".join([s.text for s in segments]).strip()
+        text = cleanup_transcription_text(text, chunk_duration_s)
+        
+        latency_ms = (time.time() - start_time) * 1000
+
+        if text:
+            emit({"log": f"Gen Text (Final={is_final}): {text}"}) # Debug Log
+            emit({
+                "transcription": text, 
+                "is_final": is_final, 
+                "recording_id": current_recording_id,
+                "speaker": speaker_label,
+                "response_ms": int(latency_ms)
+            })
+            
+    except Exception as e:
+        emit({"error": f"Transcribe error: {e}"})
+
+def transcription_worker():
+    """Background thread to process transcription jobs synchronously one by one."""
+    emit({"log": "Transcription worker thread started."})
+    while True:
+        try:
+            job = transcription_queue.get()
+            if job is None:
+                # Poison pill received, ignore and continue
+                pass
+            elif job.get("type") == "STOP":
+                emit({"log": "Transcription queue drained. Emitting final stop signal."})
+                emit({"status": "stopped"})
+            else:
+                try:
+                    emit({"status": "transcribing_final"})
+                    if job.get("is_empty_drop", False):
+                         # If it was an empty drop from VAD, just emit empty text so React resets to idle.
+                         emit({
+                             "transcription": "", 
+                             "is_final": True,
+                             "recording_id": current_recording_id,
+                             "speaker": None,
+                             "response_ms": 0
+                         })
+                    else:
+                         transcribe_segment(job["audio"], is_final=job.get("is_final", True))
+                except Exception as e:
+                    emit({"error": f"Error transcribing segment: {e}"})
+                finally:
+                    # Switch back to listening if still active
+                    if recording:
+                        emit({"status": "listening"})
+            transcription_queue.task_done()
+        except Exception as e:
+            emit({"error": f"Worker loop error: {e}"})
+
 def main():
+    emit({"log": "Main function started"})
     # Emit hardware info immediately
     emit(get_hardware_info())
+    emit({"log": f"Initial backend load: model={selected_model}, gpu={gpu_enabled}, backend={selected_backend}"})
     load_backend(selected_model, gpu_enabled, selected_backend)
 
     try:
+        emit({"log": f"Warming up audio stream for device {selected_device}"})
         start_input_stream(selected_device)
+        emit({"log": "Audio stream warmed up"})
     except Exception as e:
         emit({"error": f"Audio Stream Warmup Error: {e}"})
 
     # Command listener thread
+    emit({"log": "Starting command listener thread"})
     threading.Thread(target=command_listener, daemon=True).start()
 
-    emit({"log": "Audio engine started"})
+    # Transcription worker thread
+    emit({"log": "Starting transcription worker thread"})
+    threading.Thread(target=transcription_worker, daemon=True).start()
 
-    buffer = []
-    buffered_frames = 0
-    max_frames = RATE * MAX_BUFFER_SECONDS if MAX_BUFFER_SECONDS > 0 else 0
+    # Initialize VAD and StreamProcessor
+    emit({"log": "Initializing VAD and StreamProcessor..."})
+    global diarization_manager
+    diarization_manager = DiarizationManager()
     
+    vad = VADDetector()
+    processor = StreamProcessor(vad, chunk_size=CHUNK, sample_rate=RATE)
+
+    emit({"log": "Audio engine started with VAD and Streaming"})
+
+    was_recording = False
+
     while True:
         try:
+            # Check for recording state change (Stop pressed)
+            if was_recording and not recording:
+                if processor.is_speech_active:
+                    emit({"log": "Flushing remaining audio..."})
+                    processor.finalize_segment()
+                    processor.is_speech_active = False
+                
+                # Process all buffered segments now
+                processor.transcribe_all_pending()
+                
+                # Signal the queue that this recording session is totally done.
+                transcription_queue.put({"type": "STOP"})
+                
+                was_recording = False
+            
+            if recording:
+                was_recording = True
+
             if not audio_queue.empty():
                 audio_chunk = audio_queue.get()
-                buffer.append(audio_chunk)
-                buffered_frames += int(audio_chunk.shape[0])
-
-                while max_frames > 0 and buffered_frames > max_frames and buffer:
-                    removed = buffer.pop(0)
-                    buffered_frames -= int(removed.shape[0])
-            
-            # If stopped recording but buffer has content, transcribe
-            if not recording and len(buffer) > 0:
-                emit({"status": "transcribing"})
-                transcribe(buffer)
-                emit({"status": "ready"})
-                buffer = []
-                buffered_frames = 0
-                # Clear queue to avoid processing stale audio
-                with audio_queue.mutex:
-                    audio_queue.queue.clear()
+                if recording:
+                    processor.process(audio_chunk)
+                else:
+                    # Drain queue to prevent "ghost" audio processing after stop
+                    pass
             
             else:
-                # Avoid busy loop if queue is empty
-                time.sleep(0.01)
+                time.sleep(0.005)
 
         except Exception as e:
-            emit({"error": str(e)})
+            emit({"error": f"Stream loop error: {e}"})
             time.sleep(0.1)
 
 
@@ -1217,43 +1981,56 @@ def cleanup_transcription_text(text: str, duration_s: float) -> str:
     return normalized
 
 
-def transcribe_whispercpp(audio_int16: np.ndarray, language: str) -> tuple[str, str | None]:
-    status = get_whispercpp_status(selected_model)
-    if not status.get("available", False):
-        return "", f"whisper.cpp no disponible: {status.get('reason', 'unknown reason')}"
+def transcribe_whispercpp(audio_int16: np.ndarray, language: str, is_final: bool = True) -> tuple[str, str | None]:
+    # Fast path: if server is already running with the cached model, skip expensive file search
+    if whisper_server_process is not None and whisper_server_model_path:
+        model_path = whisper_server_model_path
+        if not is_whisper_server_ready():
+            ready, error = ensure_whisper_server(model_path, gpu_enabled)
+            if not ready:
+                return "", f"whisper-server no disponible: {error}"
+    else:
+        status = get_whispercpp_status(selected_model)
+        if not status.get("available", False):
+            return "", f"whisper.cpp no disponible: {status.get('reason', 'unknown reason')}"
+        model_path = status.get("model_path", "")
+        if not model_path:
+            return "", "whisper.cpp executable/model path missing"
+        ready, error = ensure_whisper_server(model_path, gpu_enabled)
+        if not ready:
+            return "", f"whisper-server no disponible: {error}"
 
-    model_path = status.get("model_path", "")
-    if not model_path:
-        return "", "whisper.cpp executable/model path missing"
-
-    ready, error = ensure_whisper_server(model_path, gpu_enabled)
-    if not ready:
-        return "", f"whisper-server no disponible: {error}"
-
-    wav_temp_file = None
+    # OPTIMIZATION: Use In-Memory Buffer (io.BytesIO) instead of disk I/O
     try:
-        wav_temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        wav_path = Path(wav_temp_file.name)
-        wav_temp_file.close()
-
+        wav_buffer = io.BytesIO()
         audio_contiguous = np.ascontiguousarray(audio_int16.reshape(-1).astype(np.int16))
-        with wave.open(str(wav_path), "wb") as wav_writer:
+        
+        with wave.open(wav_buffer, "wb") as wav_writer:
             wav_writer.setnchannels(1)
             wav_writer.setsampwidth(2)
             wav_writer.setframerate(RATE)
             wav_writer.writeframes(audio_contiguous.tobytes())
+        
+        # Reset pointer to start to read bytes
+        wav_buffer.seek(0)
+        audio_bytes = wav_buffer.read()
 
-        audio_bytes = wav_path.read_bytes()
         _, _, inference_url = whisper_server_urls()
+        
+        # Performance trick: disable timestamps on partial generations to get ultra-fast chunk response
+        timestamps_flag = "false" if is_final else "true"
+        
         fields: dict[str, str] = {
             "response_format": "json",
             "temperature": "0.0",
             "temperature_inc": "0.0",
-            "no_timestamps": "true",
+            "no_timestamps": timestamps_flag, 
             "suppress_non_speech": "true",
         }
         if language and language != "auto":
             fields["language"] = language
+            if language == "en":
+                fields["task"] = "translate"
 
         status_code, response_text = http_post_multipart(
             inference_url,
@@ -1279,91 +2056,7 @@ def transcribe_whispercpp(audio_int16: np.ndarray, language: str) -> tuple[str, 
         return "", f"whisper-server URL error: {e}"
     except Exception as e:
         return "", f"whisper.cpp error: {e}"
-    finally:
-        if wav_temp_file is not None:
-            try:
-                Path(wav_temp_file.name).unlink(missing_ok=True)
-            except Exception:
-                pass
 
-def transcribe(buffer):
-    global current_recording_id
-    if not buffer:
-        return
-
-    # sounddevice with CHANNELS=1 yields shape (frames, 1); flatten to mono 1D
-    audio_data = np.concatenate(buffer, axis=0)
-    if audio_data.ndim > 1:
-        audio_data = audio_data[:, 0]
-
-    if audio_data.size < int(RATE * 0.25):
-        return
-
-    chunk_duration_s = float(audio_data.size) / float(RATE)
-
-    if active_backend == "whispercpp":
-        started_at = time.perf_counter()
-        text, error = transcribe_whispercpp(audio_data, selected_language)
-        if error:
-            emit({"error": error})
-            return
-
-        text = cleanup_transcription_text(text, chunk_duration_s)
-
-        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-        if text:
-            emit({"transcription": text, "response_ms": elapsed_ms, "recording_id": current_recording_id})
-        return
-
-    # Convert to float32 for Whisper
-    audio_float32 = audio_data.astype(np.float32) / 32768.0
-    audio_float32 = np.ascontiguousarray(audio_float32.reshape(-1))
-
-    # Light preprocessing for better quality on fast models:
-    # - DC offset removal
-    # - light pre-emphasis (helps consonants)
-    # - peak normalization
-    audio_float32 = audio_float32 - float(np.mean(audio_float32))
-    if audio_float32.size > 1:
-        emphasized = np.empty_like(audio_float32)
-        emphasized[0] = audio_float32[0]
-        emphasized[1:] = audio_float32[1:] - 0.95 * audio_float32[:-1]
-        audio_float32 = emphasized
-    peak = float(np.max(np.abs(audio_float32))) if audio_float32.size else 0.0
-    if peak > 0:
-        audio_float32 = audio_float32 / peak * 0.98
-
-    with model_lock:
-        model = model_whisper
-    if model is None:
-        emit({"error": "Model not loaded"})
-        return
-
-    language = None if selected_language == "auto" else selected_language
-    started_at = time.perf_counter()
-
-    try:
-        beam_size = 2 if selected_model in {"tiny", "base"} else 1
-        segments, info = model.transcribe(
-            audio_float32,
-            beam_size=beam_size,
-            vad_filter=False,
-            language=language,
-            task="transcribe",
-        )
-    except MemoryError:
-        emit({"error": "Not enough memory to transcribe the captured audio"})
-        return
-    except Exception as e:
-        emit({"error": str(e)})
-        return
-    
-    text = " ".join([segment.text for segment in segments]).strip()
-    text = cleanup_transcription_text(text, chunk_duration_s)
-    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-    
-    if text:
-        emit({"transcription": text, "response_ms": elapsed_ms, "recording_id": current_recording_id})
 
 def command_listener():
     global recording, selected_device, selected_model, selected_model_dir, selected_language, gpu_enabled, selected_backend, current_recording_id
@@ -1396,7 +2089,10 @@ def command_listener():
             emit({"status": "recording"})
         elif line == "STOP":
             recording = False
-            emit({"status": "stopped"})
+            # We do NOT emit "stopped" here. 
+            # The main loop detects recording=False, flushes the final audio chunk to the queue,
+            # and posts a {"type": "STOP"} message. The worker thread will emit "stopped" 
+            # only after ALL pending transcriptions are fully completed.
         elif line == "HARDWARE":
             emit(get_hardware_info())
         elif line.startswith("CONFIG "):
@@ -1408,6 +2104,27 @@ def command_listener():
                 language = str(payload.get("language", selected_language))
                 prefer_gpu = bool(payload.get("gpu_enabled", gpu_enabled))
                 backend = normalize_backend_name(str(payload.get("backend", selected_backend)))
+                
+                config_uuid = str(uuid.uuid4())[:6]
+                emit({"log": f"Received CONFIG [{config_uuid}]: model={model}, gpu={prefer_gpu}, backend={backend}"})
+
+                # Sanitize model name: __custom_file__ is invalid, use default
+                if model == "__custom_file__" or not model or model.startswith("__"):
+                    model = "large-v3-turbo"
+
+                # Sanitize model_dir: ignore it if it doesn't exist or has no models
+                if model_dir and model_dir not in ("__default__", ""):
+                    model_dir_path = Path(model_dir)
+                    has_models = (
+                        model_dir_path.exists() and 
+                        model_dir_path.is_dir() and 
+                        (any(model_dir_path.glob("*.bin")) or any(model_dir_path.glob("*.gguf")))
+                    )
+                    if not has_models:
+                        model_dir = ""
+                
+                if model_dir in ("__default__", ""):
+                    model_dir = ""
 
                 previous_device = selected_device
 
@@ -1419,7 +2136,7 @@ def command_listener():
                         emit({"error": f"No se pudo actualizar el micrófono activo: {e}"})
 
                 if model == "voxtral-mini-4b-realtime-2602":
-                    emit({"error": "Voxtral requiere runtime vLLM + GPU (CUDA o ROCm). En Windows esta app no lo ejecuta de forma nativa; usa Linux/WSL con backend GPU compatible. No es compatible con faster-whisper en esta app."})
+                    emit({"error": "Voxtral requiere runtime vLLM... Usa Linux."})
                     model = selected_model
 
                 model_changed = model != selected_model
@@ -1433,25 +2150,93 @@ def command_listener():
 
                 if selected_model_dir:
                     os.environ["WHISPERCPP_MODEL_DIR"] = selected_model_dir
-                elif "WHISPERCPP_MODEL_DIR" in os.environ:
-                    del os.environ["WHISPERCPP_MODEL_DIR"]
 
                 if model_changed or model_dir_changed or gpu_changed or backend_changed:
                     selected_model = model
+                    emit({"log": f"Engine config updated [{config_uuid}] (async load pending)"})
                     load_backend_async(selected_model, gpu_enabled, selected_backend)
                 else:
                     selected_model = model
+                    emit({"log": f"Engine config updated [{config_uuid}] (no change)"})
+                    emit(get_hardware_info())
 
-                emit({"log": f"Engine config updated: mic={microphone}, model={selected_model}, model_dir={selected_model_dir}, language={selected_language}, gpu={gpu_enabled}, backend={selected_backend}, active_backend={active_backend}"})
-                emit(get_hardware_info())
             except Exception as e:
                 emit({"error": f"Invalid CONFIG payload: {e}"})
+
         elif line.startswith("DOWNLOAD "):
-            model_name = line[len("DOWNLOAD "):].strip()
+            payload_str = line[len("DOWNLOAD "):].strip()
+            model_name = ""
+            download_dir = None
+            
+            try:
+                # Try parsing as JSON first
+                payload = json.loads(payload_str)
+                if isinstance(payload, dict):
+                    model_name = payload.get("model", "")
+                    download_dir = payload.get("dir")
+                else:
+                     model_name = str(payload).strip()
+            except json.JSONDecodeError:
+                # Fallback to plain string
+                model_name = payload_str
+            
             if model_name:
-                threading.Thread(target=download_model_to_cache, args=(model_name,), daemon=True).start()
+                threading.Thread(target=download_model_to_cache, args=(model_name, download_dir), daemon=True).start()
             else:
                 emit({"error": "DOWNLOAD command missing model name"})
+        elif line.startswith("DELETE_MODEL "):
+            try:
+                payload = json.loads(line[len("DELETE_MODEL "):])
+                model_id = payload.get("model", "")
+                model_path = payload.get("path", "")
+                
+                if not model_id:
+                    emit({"error": "DELETE_MODEL missing model ID"})
+                    continue
+
+                emit({"log": f"Deleting model: {model_id}"})
+                
+                # Check if it's a file path (custom/whisper.cpp)
+                if model_path and os.path.exists(model_path):
+                     try:
+                        p = Path(model_path)
+                        if p.is_file():
+                            p.unlink()
+                            emit({"log": f"Deleted model file: {model_path}"})
+                        elif p.is_dir():
+                            # Safety check: Is this really a model dir?
+                            # For faster-whisper/huggingface, it's a dir with 'snapshots', etc. or a specific snapshot.
+                            # We should be careful.
+                            # If it's a HF repo dir like "models--Systran--faster-whisper-tiny"
+                            import shutil
+                            shutil.rmtree(model_path)
+                            emit({"log": f"Deleted model directory: {model_path}"})
+                     except Exception as e:
+                        emit({"error": f"Failed to delete {model_path}: {e}"})
+                
+                # If no path provided, try to find it in HF cache via scan_cache_dir (complex)
+                # For now, we rely on the frontend passing the path if known.
+                # If not, we can try to use HfApi to find the cache path.
+                
+                emit(get_hardware_info())
+
+            except Exception as e:
+                 emit({"error": f"DELETE_MODEL failed: {e}"})
+
+    # When we break out of the loop (EOF on stdin), the parent process has closed the pipe.
+    # This means Tauri has been killed or shut down. We must exit to prevent zombie processes.
+    emit({"log": "Stdin closed. Parent process likely died. Cleaning up and exiting."})
+    stop_whisper_server()
+    os._exit(0)
 
 if __name__ == "__main__":
-    main()
+    try:
+        log_path = setup_logging()
+        logging.info("Logging initialized.")
+        main()
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        logging.critical(f"UNCAUGHT EXCEPTION: {e}\n{error_details}")
+        emit({"error": f"Uncaught exception in main: {e}", "log": error_details})
+        sys.exit(1)

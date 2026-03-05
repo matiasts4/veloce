@@ -11,9 +11,11 @@
         "core:window:allow-close",
         "core:window:allow-set-size",
         "core:window:allow-set-resizable",
+        "core:window:allow-set-maximizable",
+        "core:window:allow-unminimize",
+        "core:window:allow-set-focus",
         "core:window:allow-set-always-on-top",
         "dialog:default",
-        "shell:default",
         "shell:allow-open",
         "shell:allow-execute",
         "global-shortcut:allow-register",
@@ -25,6 +27,11 @@
                 {
                     "name": "run-python",
                     "cmd": "python",
+                    "args": true
+                },
+                {
+                    "name": "run-venv-python",
+                    "cmd": "C:\\Users\\PC\\veloce\\.venv\\Scripts\\python.exe",
                     "args": true
                 },
                 {
