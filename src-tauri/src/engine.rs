@@ -307,6 +307,11 @@ pub async fn spawn_audio_engine<R: Runtime>(
 
 
 pub fn stop_audio_engine(state: &tauri::State<AppState>) {
+    // Attempt graceful shutdown first
+    let _ = write_engine_command(state, "EXIT\n");
+    // Give the engine a little time to gracefully tear down the whisper server
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    
     if let Ok(mut lock) = state.sidecar_child.lock() {
         if let Some(child) = lock.take() {
             let _ = child.kill();

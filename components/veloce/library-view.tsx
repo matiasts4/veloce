@@ -162,35 +162,58 @@ export function LibraryView({ onBack, className }: LibraryViewProps) {
                 </div>
               ) : (
                 filtered.map((item) => (
-                  <button
+                  <div
                     key={item.id}
+                    role="button"
+                    tabIndex={0}
                     onClick={() => {
                       setSelectedId(item.id);
                       setIsEditing(false);
                     }}
-                    className={`flex flex-col gap-1 rounded-lg border p-3 text-left transition-colors hover:bg-muted/50 ${selectedId === item.id ? "border-primary/50 bg-primary/5" : "border-transparent bg-background"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setSelectedId(item.id);
+                        setIsEditing(false);
+                      }
+                    }}
+                    className={`group flex flex-col gap-1 rounded-lg border p-3 text-left transition-colors hover:bg-muted/50 cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-ring ${selectedId === item.id ? "border-primary/50 bg-primary/5" : "border-transparent bg-background"
                       }`}
                   >
                     <p className="line-clamp-2 text-xs font-medium text-foreground">
                       {item.text || "..."}
                     </p>
-                    <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-                      <span className="flex items-center gap-1">
-                        <Calendar className="h-3 w-3" />
-                        {new Date(item.createdAt).toLocaleDateString(undefined, {
-                          month: "short",
-                          day: "numeric",
-                        })}
-                      </span>
-                      <span className="flex items-center gap-1">
-                        <Clock className="h-3 w-3" />
-                        {new Date(item.createdAt).toLocaleTimeString(undefined, {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}
-                      </span>
+                    <div className="flex items-center justify-between w-full mt-1">
+                      <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                        <span className="flex items-center gap-1">
+                          <Calendar className="h-3 w-3" />
+                          {new Date(item.createdAt).toLocaleDateString(undefined, {
+                            month: "short",
+                            day: "numeric",
+                          })}
+                        </span>
+                        <span className="flex items-center gap-1">
+                          <Clock className="h-3 w-3" />
+                          {new Date(item.createdAt).toLocaleTimeString(undefined, {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                        </span>
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity focus:opacity-100 bg-background/50 hover:bg-background"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleCopy(item.text, item.id);
+                        }}
+                        aria-label={t("library.copy")}
+                      >
+                        {copiedId === item.id ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3 text-muted-foreground" />}
+                      </Button>
                     </div>
-                  </button>
+                  </div>
                 ))
               )}
             </div>

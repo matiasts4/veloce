@@ -35,7 +35,8 @@ try:
         ["taskkill", "/F", "/IM", "whisper-server.exe"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        shell=True
     )
 except Exception:
     pass
@@ -968,6 +969,14 @@ def find_whispercpp_model_file(model_name: str) -> tuple[Path | None, str]:
         return model_path, infer_model_from_whispercpp_filename(model_path)
 
     any_models = [*model_dir.glob("ggml-*.bin"), *model_dir.glob("ggml-*.gguf")]
+    
+    # Dev environment fallback
+    env_dir = os.environ.get("WHISPERCPP_MODEL_DIR", "")
+    if env_dir and os.path.isdir(env_dir):
+        env_path = Path(env_dir)
+        any_models.extend(env_path.glob("*.bin"))
+        any_models.extend(env_path.glob("*.gguf"))
+        
     any_models = [candidate for candidate in any_models if candidate.exists() and candidate.is_file()]
     if any_models:
         any_models.sort(key=lambda path: (len(path.name), path.name))
@@ -1210,15 +1219,26 @@ def get_hardware_info():
             pass
 
         all_devices = sd.query_devices()
-        emit({"log": f"Found {len(all_devices)} audio devices"})
+        emit({"log": f"Found {len(all_devices)} total audio endpoints"})
         default_device = sd.default.device
         default_input = default_device[0] if isinstance(default_device, (list, tuple)) else None
         
         seen_names = set()
         
+        # Common output/loopback keywords to ignore (more specific to avoid false positives)
+        ignore_keywords = [
+            "altavoces", "altavoz", "speaker", "mezcla estéreo", "stereo mix", 
+            "loopback", "mapper", "onda", "wave", "mezclador", "headphones", "auriculares"
+        ]
+
         for i, dev in enumerate(all_devices):
             if dev.get('max_input_channels', 0) > 0:
                 name = dev.get('name', f"Device {i}")
+                name_lower = name.lower()
+                
+                # Filter out output devices acting as inputs
+                if any(kw in name_lower for kw in ignore_keywords):
+                    continue
                 
                 # Check for exact duplicates
                 if name in seen_names:
@@ -1580,12 +1600,33 @@ def download_model_to_cache(model_name, download_dir=None):
 def start_input_stream(device_id, force_restart=False):
     global current_stream
 
+    # Variables to track stream properties
+    stream_samplerate = RATE
+    stream_channels = CHANNELS
+    
+    # We will instantiate a resampler lazily to avoid overhead if not needed
+    resampler = None
+
     def audio_callback(indata, frames, callback_time, status):
-        # DO NOT RETURN ON STATUS. It often just means input overflow/underflow.
-        # Dropping audio here causes the engine to "freeze" listening.
+        nonlocal resampler
         if status:
-            pass # We could log it, but it might spam on certain hardware.
+            pass
         chunk = indata.copy()
+        
+        # Mix down to mono if needed
+        if stream_channels > 1:
+            chunk = np.mean(chunk, axis=1, keepdims=True).astype(np.int16)
+            
+        # Resample if needed
+        if stream_samplerate != RATE:
+            if resampler is None:
+                resampler = torchaudio.transforms.Resample(orig_freq=stream_samplerate, new_freq=RATE)
+            
+            # Convert to float32 tensor
+            chunk_tensor = torch.from_numpy(chunk).float().T # [channels, time]
+            chunk_tensor = resampler(chunk_tensor)
+            chunk = chunk_tensor.T.numpy().astype(np.int16)
+
         with pre_roll_lock:
             pre_roll_chunks.append(chunk)
         if recording:
@@ -1611,8 +1652,33 @@ def start_input_stream(device_id, force_restart=False):
     if device_id is not None:
         kwargs["device"] = device_id
 
-    current_stream = sd.InputStream(**kwargs)
-    current_stream.start()
+    try:
+        current_stream = sd.InputStream(**kwargs)
+        stream_samplerate = RATE
+        stream_channels = CHANNELS
+        current_stream.start()
+    except Exception as e:
+        emit({"log": f"Failed to open stream with default settings: {e}. Trying fallback..."})
+        try:
+            # Fallback to device's default settings
+            dev_info = sd.query_devices(device=device_id)
+            fallback_channels = int(dev_info.get("max_input_channels", 1))
+            fallback_samplerate = int(dev_info.get("default_samplerate", RATE))
+            
+            kwargs["channels"] = fallback_channels
+            kwargs["samplerate"] = fallback_samplerate
+            
+            stream_channels = fallback_channels
+            stream_samplerate = fallback_samplerate
+            
+            # Warn if fallback differs from VAD/Whisper requirements
+            emit({"log": f"Fallback stream starting at {kwargs['samplerate']}Hz, {kwargs['channels']} channels. Audio will be actively resampled."})
+            current_stream = sd.InputStream(**kwargs)
+            current_stream.start()
+        except Exception as e2:
+            current_stream = None
+            emit({"error": f"Failed to start audio stream even with fallback: {e2}"})
+            raise RuntimeError(f"Audio stream error: {e2}")
 
 
 def inject_pre_roll_audio():
@@ -2093,6 +2159,9 @@ def command_listener():
             # The main loop detects recording=False, flushes the final audio chunk to the queue,
             # and posts a {"type": "STOP"} message. The worker thread will emit "stopped" 
             # only after ALL pending transcriptions are fully completed.
+        elif line == "EXIT":
+            emit({"log": "Received EXIT command. Shutting down."})
+            break
         elif line == "HARDWARE":
             emit(get_hardware_info())
         elif line.startswith("CONFIG "):
