@@ -213,12 +213,12 @@ export function SettingsModal({
   const getDownloadButtonText = (status: DownloadStatus, progress: number, state?: ModelDownloadState) => {
     if (status === "starting") return t("settings.queued_action");
     if (status === "downloading") {
-        if (state?.total && state?.loaded) {
-             const loadedMB = (state.loaded / (1024 * 1024)).toFixed(1);
-             const totalMB = (state.total / (1024 * 1024)).toFixed(1);
-             return `${t("settings.downloading_action")} ${progress}% (${loadedMB}/${totalMB} MB)`;
-        }
-        return `${t("settings.downloading_action")} ${progress}%`;
+      if (state?.total && state?.loaded) {
+        const loadedMB = (state.loaded / (1024 * 1024)).toFixed(1);
+        const totalMB = (state.total / (1024 * 1024)).toFixed(1);
+        return `${t("settings.downloading_action")} ${progress}% (${loadedMB}/${totalMB} MB)`;
+      }
+      return `${t("settings.downloading_action")} ${progress}%`;
     }
     if (status === "completed") return t("settings.downloaded_action");
     if (status === "error") return t("settings.retry_action");
@@ -528,9 +528,8 @@ export function SettingsModal({
                 {backendOptions.map((option) => {
                   const backendState = backendMap.get(option.id);
                   const isAvailable = option.id === "auto" || backendState?.available !== false;
-                  const suffix = isAvailable ? "" : ` (${t("settings.whispercpp_unavailable").replace("whisper.cpp ", "")})`; // Reusing unavailable string part or generic "unavailable" if I had it. Actually, I should just map "unavailable".
                   return (
-                    <SelectItem key={option.id} value={option.id} disabled={!isAvailable}>
+                    <SelectItem key={option.id} value={option.id}>
                       {option.label + (isAvailable ? "" : " (unavailable)")}
                     </SelectItem>
                   );

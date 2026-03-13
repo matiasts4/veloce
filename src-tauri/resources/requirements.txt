@@ -4,8 +4,8 @@ numpy==2.2.3
 scikit-learn==1.6.1
 sounddevice==0.5.1
 speechbrain==1.0.2
-torch==2.5.1+cu124
-torchaudio==2.5.1+cu124
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
 tqdm==4.67.1
 transformers==4.49.0
 pyyaml

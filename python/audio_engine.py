@@ -105,16 +105,19 @@ class VADDetector:
     def is_speech(self, audio_chunk, sr=16000):
         # 1. Energy Calculation (RMS)
         # Keep thresholds in int16-equivalent scale even if chunk arrives normalized.
+        is_float = getattr(audio_chunk, 'dtype', None) in (np.float32, np.float64)
         if isinstance(audio_chunk, np.ndarray):
             chunk_np = audio_chunk.astype(np.float32)
         else:
             chunk_np = np.asarray(audio_chunk, dtype=np.float32)
 
         peak = float(np.max(np.abs(chunk_np))) if chunk_np.size else 0.0
-        if peak <= 1.5:
-            rms = float(np.sqrt(np.mean((chunk_np * 32768.0) ** 2)))
-        else:
-            rms = float(np.sqrt(np.mean(chunk_np ** 2)))
+        
+        # If the input was ALREADY floats normalized to [-1, 1], scale to int16 range
+        if is_float and peak > 0 and peak <= 1.0:
+            chunk_np = chunk_np * 32768.0
+            
+        rms = float(np.sqrt(np.mean(chunk_np ** 2)))
 
         # 2. Hard Silence Gate (Noise Floor)
         # If it's barely audible noise, ignore it immediately.
@@ -269,7 +272,7 @@ selected_model = "large-v3-turbo"
 selected_model_dir = ""
 selected_language = "es"
 gpu_enabled = True
-selected_backend = "faster-whisper"
+selected_backend = "auto"
 active_backend = "faster-whisper"
 current_stream = None
 model_whisper = None
@@ -823,19 +826,27 @@ def get_whispercpp_model_dir() -> Path:
         
         for candidate in candidates:
             if candidate.exists() and candidate.is_dir():
-                return candidate
+                if any(candidate.glob("*.bin")) or any(candidate.glob("*.gguf")):
+                    return candidate
 
     candidates = [
         writable_dir,
         root / "src-tauri" / "resources" / "models",
         root / "models",
         Path("C:/wsp/models"),
+        Path(os.environ.get("WHISPERCPP_MODEL_DIR", "C:/wsp/models")),
         root / "python" / "whispercpp" / "models",
     ]
 
+    existing_dirs = []
     for candidate in candidates:
         if candidate.exists() and candidate.is_dir():
-            return candidate
+            existing_dirs.append(candidate)
+            if any(candidate.glob("*.bin")) or any(candidate.glob("*.gguf")):
+                return candidate
+
+    if existing_dirs:
+        return existing_dirs[0]
 
     return candidates[0]
 
@@ -1189,6 +1200,9 @@ def get_model_directory_options() -> list[str]:
     add_path(selected_model_dir)
     add_path(os.environ.get("WHISPERCPP_MODEL_DIR"))
     add_path(get_whispercpp_model_dir())
+    # Well-known local install location
+    add_path("C:/wsp/models")
+    add_path(str(project_root() / "src-tauri" / "resources" / "whispercpp"))
 
     home = Path.home()
     hf_candidates = [
@@ -1653,10 +1667,12 @@ def start_input_stream(device_id, force_restart=False):
         kwargs["device"] = device_id
 
     try:
+        emit({"log": f"Attempting to start audio stream. Device={device_id}, channels={CHANNELS}, sr={RATE}"})
         current_stream = sd.InputStream(**kwargs)
         stream_samplerate = RATE
         stream_channels = CHANNELS
         current_stream.start()
+        emit({"log": "Audio stream started explicitly."})
     except Exception as e:
         emit({"log": f"Failed to open stream with default settings: {e}. Trying fallback..."})
         try:
@@ -2128,6 +2144,13 @@ def command_listener():
     global recording, selected_device, selected_model, selected_model_dir, selected_language, gpu_enabled, selected_backend, current_recording_id
     for line in sys.stdin:
         line = line.strip()
+        if not line:
+            continue
+            
+        # Add basic log to track incoming UI commands
+        if not line.startswith("HARDWARE"):
+            emit({"log": f"UI->Engine Command: {line[:100]}"})
+            
         if line == "START":
             if active_backend == "whispercpp":
                 model_ready = bool(get_whispercpp_status(selected_model).get("available", False))
