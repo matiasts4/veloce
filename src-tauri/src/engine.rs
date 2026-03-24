@@ -101,27 +101,47 @@ fn ensure_engine_unzipped<R: Runtime>(app: &AppHandle<R>) {
         // Ensure dir exists
         let _ = fs::create_dir_all(&engine_dir);
 
-        // Use powershell to unzip (simple, built-in)
-        // Expand-Archive -Path "C:\..." -DestinationPath "C:\..." -Force
-        let script = format!(
-            "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
-            zip.to_string_lossy(),
-            engine_dir.to_string_lossy()
-        );
+        // Use powershell to unzip (simple, built-in) on Windows
+        // Use unzip on Linux
+        #[cfg(target_os = "windows")]
+        {
+            let script = format!(
+                "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                zip.to_string_lossy(),
+                engine_dir.to_string_lossy()
+            );
 
-        match std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .output() {
-                Ok(out) => {
-                     if out.status.success() {
-                         println!("[RUST] Extraction complete.");
-                         let _ = fs::write(&marker_file, "v3");
-                     } else {
-                         println!("[RUST] Extraction failed: {:?}", String::from_utf8_lossy(&out.stderr));
-                     }
+            match std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", &script])
+                .output() {
+                    Ok(out) => {
+                         if out.status.success() {
+                             println!("[RUST] Extraction complete.");
+                             let _ = fs::write(&marker_file, "v3");
+                         } else {
+                             println!("[RUST] Extraction failed: {:?}", String::from_utf8_lossy(&out.stderr));
+                         }
+                    }
+                    Err(e) => println!("[RUST] Failed to run powershell: {}", e),
                 }
-                Err(e) => println!("[RUST] Failed to run powershell: {}", e),
-            }
+        }
+        
+        #[cfg(target_os = "linux")]
+        {
+            match std::process::Command::new("unzip")
+                .args(["-o", &zip.to_string_lossy().to_string(), "-d", &engine_dir.to_string_lossy().to_string()])
+                .output() {
+                    Ok(out) => {
+                         if out.status.success() {
+                             println!("[RUST] Extraction complete.");
+                             let _ = fs::write(&marker_file, "v3");
+                         } else {
+                             println!("[RUST] Extraction failed: {:?}", String::from_utf8_lossy(&out.stderr));
+                         }
+                    }
+                    Err(e) => println!("[RUST] Failed to run unzip: {}", e),
+                }
+        }
     } else {
         println!("[RUST] Audio engine zip not found in resources.");
     }
@@ -161,7 +181,10 @@ pub async fn spawn_audio_engine<R: Runtime>(
     // 1. Resolve Python Interpreter (Portable)
     let app_data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
     // This path must match usage in python_setup.rs
+    #[cfg(target_os = "windows")]
     let python_exe = app_data_dir.join("python-embed").join("python.exe");
+    #[cfg(target_os = "linux")]
+    let python_exe = app_data_dir.join("python-embed").join("bin").join("python");
 
     // 2. Resolve Script
     // We ensured proper script existence above
@@ -180,9 +203,6 @@ pub async fn spawn_audio_engine<R: Runtime>(
     let python_command = if python_exe.exists() {
         println!("[RUST]: Using Portable Python: {:?}", python_exe);
         python_exe.to_string_lossy().to_string()
-    } else if cfg!(debug_assertions) {
-        println!("[RUST]: Portable Python not found. Debug mode fallback to 'python'");
-        "python".to_string()
     } else {
         println!("[RUST]: Python environment not found. Triggering auto-setup...");
         match install_engine(app_handle).await {
@@ -202,7 +222,11 @@ pub async fn spawn_audio_engine<R: Runtime>(
     #[cfg(debug_assertions)]
     {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        #[cfg(target_os = "windows")]
         let whisper_path = manifest_dir.join("resources").join("whispercpp").join("whisper-cli.exe");
+        #[cfg(target_os = "linux")]
+        let whisper_path = manifest_dir.join("resources").join("whispercpp").join("whisper-cli");
+        
         println!("[RUST] Dev Mode: Force setting WHISPERCPP_EXE to {:?}", whisper_path);
         command_builder = command_builder.env("WHISPERCPP_EXE", whisper_path.to_string_lossy().to_string());
         

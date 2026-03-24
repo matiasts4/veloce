@@ -265,6 +265,9 @@ GRATITUDE_PHRASES = [
 # Globals
 recording = False
 current_recording_id = 0
+session_transcript = ""  # Accumulates all final phrases for the active recording session
+debug_callback_count = 0
+debug_process_count = 0
 audio_queue = queue.Queue()
 transcription_queue = queue.Queue() # New queue for async processing
 selected_device = None
@@ -309,7 +312,7 @@ MODEL_REPOS = {
     "small": "Systran/faster-whisper-small",
     "medium": "Systran/faster-whisper-medium",
     "large-v3": "Systran/faster-whisper-large-v3",
-    "large-v3-turbo": "Systran/faster-whisper-large-v3-turbo",
+    "large-v3-turbo": "deepdml/faster-whisper-large-v3-turbo-ct2",
     "distil-large-v3": "distil-whisper/distil-large-v3",
 }
 
@@ -379,10 +382,9 @@ def get_torch_cuda_info() -> dict:
 def choose_faster_whisper_runtime(prefer_gpu: bool) -> tuple[str, str, str]:
     cuda_info = get_torch_cuda_info()
     if prefer_gpu and cuda_info["cuda_available"]:
-        vram_gb = cuda_info.get("vram_gb")
-        if isinstance(vram_gb, (int, float)) and vram_gb < 7.5:
-            return "cuda", "int8_float16", "cuda_low_vram"
-        return "cuda", "float16", "cuda"
+        # int8_float16 is compatible with all CT2 models (int8, float16, float32)
+        # and gives near-float16 speed. Pure float16 fails on int8-quantized models.
+        return "cuda", "int8_float16", "cuda"
 
     if prefer_gpu:
         return "cpu", "int8", "no_cuda"
@@ -1115,10 +1117,13 @@ def get_downloaded_models():
         "models--Systran--faster-whisper-medium": "medium",
         "models--Systran--faster-whisper-large-v3": "large-v3",
         "models--Systran--faster-whisper-large-v3-turbo": "large-v3-turbo",
+        "models--deepdml--faster-whisper-large-v3-turbo-ct2": "large-v3-turbo",
         "models--openai--whisper-large-v3-turbo": "large-v3-turbo",
         "models--distil-whisper--distil-large-v3": "distil-large-v3",
         "models--mistralai--Voxtral-Mini-4B-Realtime-2602": "voxtral-mini-4b-realtime-2602",
     }
+    
+    unique_ids: set[str] = set()
     
     # Scan HF Cache
     if cache_dir:
@@ -1131,7 +1136,7 @@ def get_downloaded_models():
                 if not model_name and item.name.startswith("models--Systran--faster-whisper-"):
                     model_name = item.name.replace("models--Systran--faster-whisper-", "")
 
-                if model_name and model_name in SUPPORTED_MODELS and has_valid_model_snapshot(item):
+                if model_name and model_name in SUPPORTED_MODELS and model_name not in unique_ids and has_valid_model_snapshot(item):
                     # Calculate size
                     size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
                     models.append({
@@ -1142,17 +1147,68 @@ def get_downloaded_models():
                         "size": size,
                         "source": "huggingface"
                     })
+                    unique_ids.add(model_name)
         except Exception:
             pass
 
-    # Scan Custom/Local Dir (whisper.cpp style or direct faster-whisper dumps)
+    # Scan Custom/Local Dir for CT2 (faster-whisper) folders AND .bin/.gguf (whisper.cpp) files
+    scan_dirs = []
     if custom_dir and custom_dir.exists():
+        scan_dirs.append(custom_dir)
+    
+    # Also scan user's selected model dir if it differs
+    if selected_model_dir:
+        sel_path = Path(selected_model_dir).expanduser().resolve()
+        if sel_path.exists() and sel_path not in scan_dirs:
+            scan_dirs.append(sel_path)
+        # Also scan the parent dir in case selected_model_dir IS the model folder itself
+        parent = sel_path.parent
+        if parent.exists() and parent not in scan_dirs and parent != sel_path:
+            scan_dirs.append(parent)
+    
+    for scan_dir in scan_dirs:
         try:
-            for f in custom_dir.iterdir():
-                if f.is_file() and (f.suffix == '.bin' or f.suffix == '.gguf'):
-                    # Check if it matches a known model ID
+            for f in scan_dir.iterdir():
+                # Check for CT2-format model folders (faster-whisper): requires model.bin > 100MB and config.json
+                if f.is_dir() and (f / "config.json").exists():
+                    model_bin = f / "model.bin"
+                    if model_bin.exists() and model_bin.stat().st_size > 50 * 1024 * 1024:  # > 50MB
+                        # Try to infer model ID from folder name
+                        folder_name = f.name.lower().replace("_", "-")
+                        matched_id = None
+                        for mid in sorted(SUPPORTED_MODELS, key=len, reverse=True):
+                            if mid in folder_name or folder_name == mid:
+                                matched_id = mid
+                                break
+                        if not matched_id and "large" in folder_name and "turbo" in folder_name:
+                            matched_id = "large-v3-turbo"
+                        elif not matched_id and "large" in folder_name:
+                            matched_id = "large-v3"
+                        elif not matched_id and "medium" in folder_name:
+                            matched_id = "medium"
+                        elif not matched_id and "small" in folder_name:
+                            matched_id = "small"
+                        elif not matched_id and "base" in folder_name:
+                            matched_id = "base"
+                        elif not matched_id and "tiny" in folder_name:
+                            matched_id = "tiny"
+                        
+                        if matched_id and matched_id in SUPPORTED_MODELS and matched_id not in unique_ids:
+                            size = int(model_bin.stat().st_size)
+                            models.append({
+                                "id": matched_id,
+                                "name": matched_id.replace("-", " ").title(),
+                                "downloaded": True,
+                                "path": str(f),
+                                "size": size,
+                                "source": "local_folder"
+                            })
+                            unique_ids.add(matched_id)
+
+                # Check for whispercpp-style .bin/.gguf files (only outside a CT2 model dir)
+                elif f.is_file() and (f.suffix in ('.bin', '.gguf')) and f.stem.lower() != "model":
                     model_id = infer_model_from_whispercpp_filename(f)
-                    if model_id:
+                    if model_id and model_id in SUPPORTED_MODELS and model_id not in unique_ids:
                         models.append({
                             "id": model_id,
                             "name": model_id.replace("-", " ").title(),
@@ -1161,16 +1217,19 @@ def get_downloaded_models():
                             "size": f.stat().st_size,
                             "source": "local"
                         })
+                        unique_ids.add(model_id)
         except Exception:
             pass
 
     unique_models = {}
     for m in models:
-        if m["id"] not in unique_models:
-             unique_models[m["id"]] = m
+        mid = m["id"]
+        if mid not in unique_models:
+            unique_models[mid] = m
         else:
-             # If duplicate, maybe prefer one with path or larger size?
-             pass
+            # Prefer local_folder over HuggingFace cache (user explicitly chose it)
+            if m.get("source") == "local_folder":
+                unique_models[mid] = m
 
     return list(unique_models.values())
 
@@ -1201,7 +1260,8 @@ def get_model_directory_options() -> list[str]:
     add_path(os.environ.get("WHISPERCPP_MODEL_DIR"))
     add_path(get_whispercpp_model_dir())
     # Well-known local install location
-    add_path("C:/wsp/models")
+    add_path(str(Path.home() / "Descargas"))
+    add_path(str(Path.home() / "Downloads"))
     add_path(str(project_root() / "src-tauri" / "resources" / "whispercpp"))
 
     home = Path.home()
@@ -1248,6 +1308,19 @@ def get_hardware_info():
         for i, dev in enumerate(all_devices):
             if dev.get('max_input_channels', 0) > 0:
                 name = dev.get('name', f"Device {i}")
+                
+                # Cleanup ALSA/Linux formatting issues
+                if " (hw:" in name:
+                    name = name.split(" (hw:")[0]
+                elif "(hw:" in name:
+                    name = name.split("(hw:")[0]
+                    
+                if name.endswith(":-") or name.endswith(": -"):
+                    name = name[:-2].strip()
+                    
+                if name.lower() == "default":
+                    name = "Default System Microphone"
+                    
                 name_lower = name.lower()
                 
                 # Filter out output devices acting as inputs
@@ -1268,8 +1341,12 @@ def get_hardware_info():
                     "host_api": dev.get('hostapi')
                 })
     except Exception as e:
-        emit({"error": f"Error querying audio devices: {e}"})
-        devices = [{"id": -1, "name": f"Error: {e}", "host_api": -1}]
+        err_str = str(e)
+        emit({"error": f"Error querying audio devices: {err_str}"})
+        friendly = "Audio no disponible - verifica que PulseAudio/PipeWire esté corriendo"
+        if "PortAudio" in err_str or "PaError" in err_str:
+            friendly = "Sin acceso a audio (PortAudio no inicializado)"
+        devices = [{"id": -1, "name": friendly, "host_api": -1}]
     
     cuda_info = get_torch_cuda_info()
     gpu_available = bool(cuda_info["cuda_available"])
@@ -1318,10 +1395,13 @@ def get_hardware_info():
     ]
 
     for model_entry in fallback_models:
-        model_file, _ = find_whispercpp_model_file(model_entry["id"])
-        if model_file is not None:
-            model_entry["downloaded"] = True
-            model_entry["path"] = str(model_file)
+        # Only check for whispercpp-style .bin/.gguf files when whispercpp is the active backend.
+        # For faster-whisper, trust only HF/CT2 scan to avoid false positives from wildcard matching.
+        if active_backend in ("whispercpp",):
+            model_file, _ = find_whispercpp_model_file(model_entry["id"])
+            if model_file is not None:
+                model_entry["downloaded"] = True
+                model_entry["path"] = str(model_file)
 
     merged_models = {m["id"]: m for m in fallback_models}
     for model in models:
@@ -1363,7 +1443,6 @@ def get_hardware_info():
         "model_dirs": get_model_directory_options(),
         "default_model_dir": str(get_whispercpp_model_dir()),
     }
-    emit({"log": f"Hardware info: {len(devices)} mics, GPU={gpu_available}, {len(info['models'])} models"})
     return info
 
 
@@ -1392,7 +1471,23 @@ def load_whisper(model_name, prefer_gpu):
             del previous_model
             gc.collect()
 
-        loaded = WhisperModel(model_name, device=device, compute_type=compute_type)
+        target_path = model_name
+        
+        # Check if the model exists in the custom model directory
+        if selected_model_dir and os.path.isdir(selected_model_dir):
+            potential_path = os.path.join(selected_model_dir, model_name)
+            if os.path.isdir(potential_path) and os.path.exists(os.path.join(potential_path, "model.bin")):
+                target_path = potential_path
+                emit({"log": f"Found faster-whisper model in custom directory: {target_path}"})
+            elif os.path.exists(os.path.join(selected_model_dir, "model.bin")) and os.path.exists(os.path.join(selected_model_dir, "config.json")):
+                target_path = selected_model_dir
+                emit({"log": f"Found faster-whisper model root in custom directory: {target_path}"})
+
+        cpu_count = os.cpu_count() or 4
+        cpu_threads = max(4, cpu_count)
+        num_workers = min(2, cpu_count // 2)
+        emit({"log": f"Loading WhisperModel: {target_path} | device={device} compute={compute_type} threads={cpu_threads} workers={num_workers}"})
+        loaded = WhisperModel(target_path, device=device, compute_type=compute_type, cpu_threads=cpu_threads, num_workers=num_workers)
         with model_lock:
             model_whisper = loaded
         load_uuid = str(uuid.uuid4())[:6]
@@ -1623,31 +1718,42 @@ def start_input_stream(device_id, force_restart=False):
 
     def audio_callback(indata, frames, callback_time, status):
         nonlocal resampler
-        if status:
-            pass
-        chunk = indata.copy()
-        
-        # Mix down to mono if needed
-        if stream_channels > 1:
-            chunk = np.mean(chunk, axis=1, keepdims=True).astype(np.int16)
+        global recording
+        try:
+            if status:
+                pass
+            chunk = indata.copy()
             
-        # Resample if needed
-        if stream_samplerate != RATE:
-            if resampler is None:
-                resampler = torchaudio.transforms.Resample(orig_freq=stream_samplerate, new_freq=RATE)
-            
-            # Convert to float32 tensor
-            chunk_tensor = torch.from_numpy(chunk).float().T # [channels, time]
-            chunk_tensor = resampler(chunk_tensor)
-            chunk = chunk_tensor.T.numpy().astype(np.int16)
+            # Mix down to mono if needed
+            if stream_channels > 1:
+                chunk = np.mean(chunk, axis=1, keepdims=True).astype(np.int16)
+                
+            # Resample if needed
+            if stream_samplerate != RATE:
+                if resampler is None:
+                    resampler = torchaudio.transforms.Resample(orig_freq=stream_samplerate, new_freq=RATE)
+                
+                # Convert to float32 tensor
+                chunk_tensor = torch.from_numpy(chunk).float().T # [channels, time]
+                chunk_tensor = resampler(chunk_tensor)
+                chunk = chunk_tensor.T.numpy().astype(np.int16)
 
-        with pre_roll_lock:
-            pre_roll_chunks.append(chunk)
-        if recording:
-            audio_queue.put(chunk)
+            with pre_roll_lock:
+                pre_roll_chunks.append(chunk)
+            if recording:
+                global debug_callback_count
+                debug_callback_count += 1
+                if debug_callback_count == 1 or debug_callback_count % 50 == 0:
+                    emit({"log": f"Audio callback running, chunk len={len(chunk)}, rms={float(np.sqrt(np.mean(chunk.astype(np.float32)**2))):.2f}"})
+                audio_queue.put(chunk)
+        except Exception as e:
+            emit({"error": f"Audio callback crashed: {e}"})
 
     if current_stream is not None and not force_restart:
-        return
+        if getattr(current_stream, 'active', False):
+            return
+        else:
+            emit({"log": "Existing stream is dead/inactive. Forcing restart."})
 
     if current_stream is not None:
         try:
@@ -1729,7 +1835,11 @@ class StreamProcessor:
 
     def process(self, audio_chunk):
         # audio_chunk: numpy array (int16 or float32)
-
+        global debug_process_count
+        debug_process_count += 1
+        if debug_process_count == 1 or debug_process_count % 50 == 0:
+            emit({"log": f"Processor tick: active={self.is_speech_active}, buffer={len(self.speech_buffer)}, sil_{self.silence_counter}"})
+            
         is_speech_frame = self.vad.is_speech(audio_chunk, self.sample_rate)
         
         if is_speech_frame:
@@ -1879,6 +1989,7 @@ def transcribe_segment(audio_data, is_final=False):
         model = model_whisper
     
     if model is None:
+        emit({"error": "Model not loaded. Cannot transcribe. Check model selection and GPU settings."})
         return
 
     try:
@@ -1903,9 +2014,20 @@ def transcribe_segment(audio_data, is_final=False):
         latency_ms = (time.time() - start_time) * 1000
 
         if text:
-            emit({"log": f"Gen Text (Final={is_final}): {text}"}) # Debug Log
+            
+            # Build cumulative session text for final segments
+            cumulative = text
+            if is_final:
+                global session_transcript
+                session_transcript = (session_transcript + " " + text).strip() if session_transcript else text
+                cumulative = session_transcript
+            else:
+                # For partials, show the committed session so far + this partial
+                cumulative = (session_transcript + " " + text).strip() if session_transcript else text
+            
             emit({
-                "transcription": text, 
+                "transcription": cumulative,
+                "phrase_text": text,
                 "is_final": is_final, 
                 "recording_id": current_recording_id,
                 "speaker": speaker_label,
@@ -2141,7 +2263,7 @@ def transcribe_whispercpp(audio_int16: np.ndarray, language: str, is_final: bool
 
 
 def command_listener():
-    global recording, selected_device, selected_model, selected_model_dir, selected_language, gpu_enabled, selected_backend, current_recording_id
+    global recording, selected_device, selected_model, selected_model_dir, selected_language, gpu_enabled, selected_backend, current_recording_id, session_transcript
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -2173,6 +2295,7 @@ def command_listener():
                 emit({"error": f"Audio Stream Error: {e}"})
                 continue
             current_recording_id += 1
+            session_transcript = ""  # Reset session buffer on new recording
             recording = True
             inject_pre_roll_audio()
             emit({"status": "recording"})

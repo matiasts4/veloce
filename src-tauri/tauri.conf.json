@@ -33,8 +33,18 @@
     "bundle": {
         "active": true,
         "targets": [
-            "nsis"
+            "nsis",
+            "deb",
+            "appimage"
         ],
+        "linux": {
+            "deb": {
+                "depends": [
+                    "python3-venv",
+                    "libportaudio2"
+                ]
+            }
+        },
         "resources": [
             "../python/audio_engine.py",
             "resources/python-3.11.9-embed-amd64.zip",

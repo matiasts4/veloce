@@ -156,6 +156,7 @@ export default function VelocePage() {
   const miniIsListening = isActive && status === "listening";
   const activeRecordingIdRef = useRef<number | null>(null);
   const committedTranscriptRef = useRef("");
+  const sessionTranscriptRef = useRef(""); // All finals accumulated for the full session
   const sessionSavedRef = useRef(false);
   const clipboardModeRef = useRef(clipboardMode);
   const clipboardAutoPasteRef = useRef(clipboardAutoPaste);
@@ -366,6 +367,7 @@ export default function VelocePage() {
       if (typeof recording === "boolean" && recording) {
         activeRecordingIdRef.current = null;
         committedTranscriptRef.current = "";
+        sessionTranscriptRef.current = "";
         setLatestTranscript("");
         setLastResponseMs(null);
         setIsActive(recording);
@@ -476,6 +478,7 @@ export default function VelocePage() {
           if (isRecording) {
             activeRecordingIdRef.current = null;
             committedTranscriptRef.current = "";
+            sessionTranscriptRef.current = "";
             setLatestTranscript("");
             setLastResponseMs(null);
             setEngineError(""); // Clear error on start
@@ -594,59 +597,37 @@ export default function VelocePage() {
           const responseMs = typeof payload === "string" ? null : payload?.response_ms;
           const recordingId = typeof payload === "string" ? null : (typeof payload?.recording_id === "number" ? payload.recording_id : null);
 
-          setLatestTranscript((previous) => {
+          // Backend sends cumulative session text directly - just display it
+          setLatestTranscript((_previous) => {
             const chunk = text.trim();
-            if (!chunk) {
-              return previous;
-            }
+            if (!chunk) return _previous;
+            return chunk;
+          });
 
-            if (recordingId !== null) {
-              if (activeRecordingIdRef.current === null || activeRecordingIdRef.current !== recordingId) {
-                activeRecordingIdRef.current = recordingId;
-                // Save the currently accumulated text as the base for the new segment
-                committedTranscriptRef.current = previous;
-              }
-            }
-
-            const committed = committedTranscriptRef.current;
-            let newText = "";
-            if (isFinal) {
-              newText = mergeTranscriptText(committed, chunk);
-              committedTranscriptRef.current = newText;
-            } else {
-              // Only fallback to `previous` if the backend doesn't support recording IDs
-              const previewBase = recordingId !== null ? committed : (committed || previous);
-              newText = mergeTranscriptText(previewBase, chunk);
-            }
-
-            if (isFinal) {
-              const textToOutput = committed ? ` ${chunk}` : chunk;
-
-              if (clipboardModeRef.current) {
-                if (clipboardAutoPasteRef.current) {
-                  import("@/lib/tauri-client").then(({ safeInvoke }) => {
-                    safeInvoke("set_clipboard", { text: textToOutput })
-                      .then(() => safeInvoke("press_paste_shortcut"))
-                      .then(() => new Promise(resolve => setTimeout(resolve, 80)))
-                      .then(() => safeInvoke("set_clipboard", { text: newText }))
-                      .catch(console.error);
-                  });
-                }
+          // Output actions: type/clipboard only for final segments, using phrase_text (just the new phrase)
+          if (isFinal && text.trim()) {
+            const phraseText = (typeof payload === "object" && payload !== null && (payload as Record<string, unknown>)?.phrase_text)
+              ? String((payload as Record<string, unknown>).phrase_text).trim()
+              : text.trim();
+            const textToOutput = phraseText;
+            if (clipboardModeRef.current) {
+              if (clipboardAutoPasteRef.current) {
+                import("@/lib/tauri-client").then(({ safeInvoke }) => {
+                  safeInvoke("set_clipboard", { text: textToOutput })
+                    .then(() => safeInvoke("press_paste_shortcut"))
+                    .catch(console.error);
+                });
               } else {
                 import("@/lib/tauri-client").then(({ safeInvoke }) => {
-                  safeInvoke("type_text", { text: textToOutput }).catch(console.error);
+                  safeInvoke("set_clipboard", { text });
                 });
               }
-            }
-
-            if (clipboardModeRef.current && (!isFinal || !clipboardAutoPasteRef.current)) {
+            } else {
               import("@/lib/tauri-client").then(({ safeInvoke }) => {
-                safeInvoke("set_clipboard", { text: newText }).catch(console.error);
+                safeInvoke("type_text", { text: ` ${textToOutput}` }).catch(console.error);
               });
             }
-
-            return newText;
-          });
+          }
           if (typeof responseMs === "number") {
             setLastResponseMs(Math.max(0, Math.round(responseMs)));
           }

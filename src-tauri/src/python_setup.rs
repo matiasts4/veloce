@@ -14,6 +14,7 @@ const PYTHON_DIR_NAME: &str = "python-embed";
 // Initial dummy requirements
 const REQUIREMENTS_FILE_NAME: &str = "requirements.txt";
 
+#[cfg(target_os = "windows")]
 pub async fn setup_python_environment<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let resources_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
@@ -168,6 +169,7 @@ pub async fn setup_python_environment<R: Runtime>(app: &AppHandle<R>) -> Result<
     Ok(python_exe)
 }
 
+#[cfg(target_os = "windows")]
 async fn setup_whisper_cpp<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     emit_log(app, "Setting up WhisperCPP...");
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -244,4 +246,134 @@ async fn setup_whisper_cpp<R: Runtime>(app: &AppHandle<R>) -> Result<(), String>
 fn emit_log<R: Runtime>(app: &AppHandle<R>, msg: &str) {
     let _ = app.emit("log-message", msg);
     println!("[SETUP] {}", msg);
+}
+
+#[cfg(target_os = "linux")]
+pub async fn setup_python_environment<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let resources_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+
+    let python_dir = app_dir.join(PYTHON_DIR_NAME);
+    let python_exe = python_dir.join("bin").join("python");
+
+    if python_exe.exists() {
+         if let Err(e) = setup_whisper_cpp(app).await {
+              emit_log(app, &format!("Warning: Failed to setup WhisperCPP: {}", e));
+         }
+        return Ok(python_exe);
+    }
+
+    emit_log(app, "Configuring Python virtual environment on Linux...");
+
+    if !python_dir.exists() {
+        fs::create_dir_all(&python_dir).map_err(|e| e.to_string())?;
+    }
+
+    let status = Command::new("python3")
+        .args(&["-m", "venv", &python_dir.to_string_lossy().into_owned()])
+        .status()
+        .map_err(|e| format!("Failed to run python3 -m venv: {}", e))?;
+
+    if !status.success() {
+        return Err("Failed to create python3 virtual environment. Please ensure python3-venv is installed.".to_string());
+    }
+    
+    emit_log(app, "Python venv created.");
+
+    let mut req_paths = vec![
+        resources_dir.join(REQUIREMENTS_FILE_NAME),
+    ];
+    
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            req_paths.push(exe_dir.join(REQUIREMENTS_FILE_NAME));
+            req_paths.push(exe_dir.join("resources").join(REQUIREMENTS_FILE_NAME));
+        }
+    }
+
+    if let Some(req_path) = req_paths.into_iter().find(|p| p.exists()) {
+        emit_log(app, &format!("Installing dependencies from: {:?}", req_path));
+        
+        let _ = Command::new(&python_exe)
+            .args(&["-m", "pip", "install", "--upgrade", "pip"])
+            .status();
+
+        let status = Command::new(&python_exe)
+            .args(&["-m", "pip", "install", "-r", &req_path.to_string_lossy().into_owned()])
+            .status()
+            .map_err(|e| format!("Failed to install requirements: {}", e))?;
+            
+        if !status.success() {
+            return Err("Failed to pip install requirements".to_string());
+        }
+    } else {
+        emit_log(app, "Warning: requirements.txt not found. Skipping dependency installation.");
+    }
+
+    emit_log(app, "Python environment ready.");
+    
+    if let Err(e) = setup_whisper_cpp(app).await {
+         emit_log(app, &format!("Warning: Failed to setup WhisperCPP: {}", e));
+    }
+    
+    Ok(python_exe)
+}
+
+#[cfg(target_os = "linux")]
+async fn setup_whisper_cpp<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    emit_log(app, "Setting up WhisperCPP...");
+    let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let resources_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+    
+    let mut whisper_paths = vec![resources_dir.join("whispercpp")];
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            whisper_paths.push(exe_dir.join("whispercpp"));
+            whisper_paths.push(exe_dir.join("resources").join("whispercpp"));
+        }
+    }
+    let whisper_src = whisper_paths.into_iter().find(|p| p.exists());
+    
+    let mut models_paths = vec![resources_dir.join("models")];
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            models_paths.push(exe_dir.join("models"));
+            models_paths.push(exe_dir.join("resources").join("models"));
+        }
+    }
+    let models_src = models_paths.into_iter().find(|p| p.exists());
+
+    let copy_dir = |src: &Path, dst: &Path| -> Result<(), String> {
+         let status = Command::new("cp")
+            .args(&["-r", &src.to_string_lossy().into_owned(), &dst.to_string_lossy().into_owned()])
+            .status()
+            .map_err(|e| format!("Failed to run copy: {}", e))?;
+            
+         if !status.success() {
+             return Err(format!("Failed to copy {:?} to {:?}", src, dst));
+         }
+         Ok(())
+    };
+
+    if let Some(src) = whisper_src {
+        let dst = app_dir.join("whispercpp");
+        if !dst.exists() || dst.read_dir().map(|mut i| i.next().is_none()).unwrap_or(true) {
+            emit_log(app, &format!("Copying WhisperCPP from {:?}...", src));
+            copy_dir(&src, &app_dir)?; 
+        } else {
+            emit_log(app, "WhisperCPP already exists, skipping copy.");
+        }
+    }
+    
+    if let Some(src) = models_src {
+         let dst = app_dir.join("models");
+         if !dst.exists() || dst.read_dir().map(|mut i| i.next().is_none()).unwrap_or(true) {
+             emit_log(app, &format!("Copying Models from {:?}...", src));
+             copy_dir(&src, &app_dir)?;
+         } else {
+             emit_log(app, "Models already exist, skipping copy.");
+         }
+    }
+
+    Ok(())
 }
