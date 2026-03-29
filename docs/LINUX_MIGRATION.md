@@ -233,3 +233,6 @@ Debido a la naturaleza compartida de los eventos del ratón (Drag & Drop vs Clic
 
 ### Soporte a Hotplug de Micrófonos en PipeWire
 Al utilizar la herramienta combinada de `wpctl` (PipeWire) sobre PortAudio/ALSA, los identificadores de nuevos micrófonos se abstraen temporalmente bajo strings ("pw_85") hasta reiniciar el stream. El backend detectaba esto y arrojaba una excepción silenciosa `ValueError` al castear el str a integer, bloqueando el refresco de dispositivos. Se corrigió la delegación de `selected_device` para inyectar correctamente la variable de entorno `PIPEWIRE_NODE` desde strings dinámicos, liberando el `device_id` natural al default wrapper de ALSA.
+
+### Intercepción de Clics en Widget Minimizado
+Debido a que XWayland y X11 manejan las áreas transparentes de la ventana como superficies sólidas que interceptan eventos del puntero magnético, el `MINI_WIDTH` de 240px x 68px original sobre-alcanzaba el componente visual del widget tipo "píldora" (que era de ~170px x 44px). Esto provocaba que clescar al lado del widget tomara el evento la app Veloce, bloqueando clics en ventanas de fondo (ej: barras superiores u otras aplicaciones). Se ajustó el tamaño lógico de Tauri (`184x56`) para que envuelva ajustadamente al componente, liberando el espacio invisible para que los eventos del ratón pasen limpiamente a través del sistema operativo.
