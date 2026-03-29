@@ -43,8 +43,8 @@ const NORMAL_WIDTH = 500;
 const NORMAL_HEIGHT = 620;
 const LARGE_WIDTH = 700;
 const LARGE_HEIGHT = 640;
-const MINI_WIDTH = 240;
-const MINI_HEIGHT = 68;
+const MINI_WIDTH = 184;
+const MINI_HEIGHT = 56;
 // Minimum time to show the loading screen to mask backend instability (ms)
 const MIN_BOOT_TIME_MS = 3500;
 
@@ -132,7 +132,7 @@ export default function VelocePage() {
   const [startWithWindows, setStartWithWindows] = useState(false);
   const [closeToMiniWidget, setCloseToMiniWidget] = useState(true);
   const [gpuEnabled, setGpuEnabled] = useState(false);
-  const [availableMics, setAvailableMics] = useState<{ id: number; name: string }[]>([]);
+  const [availableMics, setAvailableMics] = useState<{ id: number | string; name: string }[]>([]);
   const [downloadedModels, setDownloadedModels] = useState<{ id: string; name: string; downloaded?: boolean }[]>([]);
   const [modelDownloads, setModelDownloads] = useState<Record<string, ModelDownloadState>>({});
   const [activeModelDownload, setActiveModelDownload] = useState<string | null>(null);
