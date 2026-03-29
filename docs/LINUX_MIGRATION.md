@@ -230,3 +230,6 @@ Los compositores modernos de Wayland (especialmente Mutter en GNOME/Kali) bloque
 
 ### UX (Experiencia de Usuario) Minimizado
 Debido a la naturaleza compartida de los eventos del ratón (Drag & Drop vs Clics) en marcos WebView sin decoraciones, la acción de sujetar el widget flotante con clics para moverlo (`data-tauri-drag-region`) detonaba accidentalmente el evento de expansión global `onClick` en DOM al soltarse. Se reemplazó estandarizadamente a interacción del tipo `onDoubleClick`, imitando el comportamiento nativo de widgets de sistema de Linux y macOS.
+
+### Soporte a Hotplug de Micrófonos en PipeWire
+Al utilizar la herramienta combinada de `wpctl` (PipeWire) sobre PortAudio/ALSA, los identificadores de nuevos micrófonos se abstraen temporalmente bajo strings ("pw_85") hasta reiniciar el stream. El backend detectaba esto y arrojaba una excepción silenciosa `ValueError` al castear el str a integer, bloqueando el refresco de dispositivos. Se corrigió la delegación de `selected_device` para inyectar correctamente la variable de entorno `PIPEWIRE_NODE` desde strings dinámicos, liberando el `device_id` natural al default wrapper de ALSA.

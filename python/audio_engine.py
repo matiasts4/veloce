@@ -1324,41 +1324,69 @@ def get_hardware_info():
             "loopback", "mapper", "onda", "wave", "mezclador", "headphones", "auriculares"
         ]
 
-        for i, dev in enumerate(all_devices):
-            if dev.get('max_input_channels', 0) > 0:
-                name = dev.get('name', f"Device {i}")
-                
-                # Cleanup ALSA/Linux formatting issues
-                if " (hw:" in name:
-                    name = name.split(" (hw:")[0]
-                elif "(hw:" in name:
-                    name = name.split("(hw:")[0]
-                    
-                if name.endswith(":-") or name.endswith(": -"):
-                    name = name[:-2].strip()
-                    
-                if name.lower() == "default":
-                    name = "Default System Microphone"
-                    
-                name_lower = name.lower()
-                
-                # Filter out output devices acting as inputs
-                if any(kw in name_lower for kw in ignore_keywords):
-                    continue
-                
-                # Check for exact duplicates
-                if name in seen_names:
-                    continue
-                seen_names.add(name)
+        if sys.platform.startswith('linux'):
+            import subprocess, re
+            try:
+                out = subprocess.check_output(["wpctl", "status"], stderr=subprocess.DEVNULL, timeout=2).decode("utf-8")
+                sources_section = False
+                for line in out.split("\n"):
+                    if "├─ Sources:" in line:
+                        sources_section = True
+                        continue
+                    if sources_section and ("├─" in line or "└─" in line or line.strip() == ""):
+                        sources_section = False
+                    if sources_section:
+                        match = re.search(r"(\*?)\s+(\d+)\.\s+(.+?)\s+\[vol:", line)
+                        if match:
+                            is_default = match.group(1) == "*"
+                            node_id = match.group(2)
+                            name = match.group(3).strip()
+                            if is_default:
+                                name = f"{name} (Default)"
+                            devices.append({
+                                "id": f"pw_{node_id}",
+                                "name": name,
+                                "host_api": "pipewire"
+                            })
+            except Exception:
+                pass
 
-                if i == default_input:
-                    name = f"{name} (Default)"
+        if not devices:
+            for i, dev in enumerate(all_devices):
+                if dev.get('max_input_channels', 0) > 0:
+                    name = dev.get('name', f"Device {i}")
                     
-                devices.append({
-                    "id": i,
-                    "name": name,
-                    "host_api": dev.get('hostapi')
-                })
+                    # Cleanup ALSA/Linux formatting issues
+                    if " (hw:" in name:
+                        name = name.split(" (hw:")[0]
+                    elif "(hw:" in name:
+                        name = name.split("(hw:")[0]
+                        
+                    if name.endswith(":-") or name.endswith(": -"):
+                        name = name[:-2].strip()
+                        
+                    if name.lower() == "default":
+                        name = "Default System Microphone"
+                        
+                    name_lower = name.lower()
+                    
+                    # Filter out output devices acting as inputs
+                    if any(kw in name_lower for kw in ignore_keywords):
+                        continue
+                    
+                    # Check for exact duplicates
+                    if name in seen_names:
+                        continue
+                    seen_names.add(name)
+
+                    if i == default_input:
+                        name = f"{name} (Default)"
+                        
+                    devices.append({
+                        "id": i,
+                        "name": name,
+                        "host_api": dev.get('hostapi')
+                    })
     except Exception as e:
         err_str = str(e)
         emit({"error": f"Error querying audio devices: {err_str}"})
@@ -1795,6 +1823,17 @@ def start_input_stream(device_id, force_restart=False):
         "blocksize": CHUNK,
         "dtype": "int16",
     }
+    if isinstance(device_id, str) and device_id.startswith("pw_"):
+        node_id = device_id.split("_")[1]
+        os.environ["PIPEWIRE_NODE"] = node_id
+        emit({"log": f"Routed PipeWire ALSA to target node {node_id}"})
+        # Allow ALSA default wrapper (pipewire) to capture via standard stream
+        device_id = None
+    else:
+        # Clear any previously forced nodes
+        if "PIPEWIRE_NODE" in os.environ:
+            del os.environ["PIPEWIRE_NODE"]
+
     if device_id is not None:
         kwargs["device"] = device_id
 
@@ -2362,7 +2401,12 @@ def command_listener():
 
                 previous_device = selected_device
 
-                selected_device = None if microphone == "default" else int(microphone)
+                if microphone == "default":
+                    selected_device = None
+                elif isinstance(microphone, str) and microphone.startswith("pw_"):
+                    selected_device = microphone
+                else:
+                    selected_device = int(microphone)
                 if selected_device != previous_device and not recording:
                     try:
                         start_input_stream(selected_device, force_restart=True)
