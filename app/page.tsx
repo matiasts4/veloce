@@ -254,8 +254,10 @@ export default function VelocePage() {
             const { getCurrentWindow } = windowApi;
             const { LogicalSize } = dpiApi;
             const window = getCurrentWindow();
-            await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
             await window.setAlwaysOnTop(true);
+            setTimeout(async () => {
+              await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
+            }, 250);
           })
           .catch((error) => console.error("Failed to minimize from hotkey", error));
       });
@@ -295,8 +297,10 @@ export default function VelocePage() {
           const window = getCurrentWindow();
           await window.setResizable(false);
           await window.setMaximizable(false);
-          await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
           await window.setAlwaysOnTop(true);
+          setTimeout(async () => {
+            await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
+          }, 250);
         })
         .catch((error) => console.error("Failed to minimize to mini widget", error));
     });
@@ -382,6 +386,22 @@ export default function VelocePage() {
       setEngineError(t("main.start_stop_recording_error"));
     }
   }, [t]);
+
+  // Listen for the Wayland global stealth HTTP listener
+  useEffect(() => {
+    let unlistenGlobalToggle: () => void;
+    import("@/lib/tauri-client").then(({ isTauri }) => {
+      if (!isTauri()) return;
+      import("@tauri-apps/api/event").then(async ({ listen }) => {
+        unlistenGlobalToggle = await listen("global-toggle-capture", () => {
+          handleToggleCapture();
+        });
+      });
+    });
+    return () => {
+      if (unlistenGlobalToggle) unlistenGlobalToggle();
+    };
+  }, [handleToggleCapture]);
 
   // Register global hotkeys (disabled while recording a new keybind)
   useHotkey(toggleWidgetCombo, handleToggleVisibility, !isRecording);
@@ -1101,7 +1121,7 @@ export default function VelocePage() {
       className="h-full w-full overflow-hidden bg-transparent p-0"
       style={{ backgroundColor: "transparent" }}
     >
-      <AnimatePresence mode="wait">
+      <AnimatePresence>
         {isVisible ? (
           <motion.div
             key="widget"

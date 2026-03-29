@@ -27,7 +27,7 @@ sudo apt update
 sudo apt install -y \
   build-essential pkg-config curl wget git file \
   libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
-  libwebkit2gtk-4.1-dev \
+  libwebkit2gtk-4.1-dev libxdo-dev \
   python3 python3-venv python3-dev python3-pip \
   portaudio19-dev libasound2-dev \
   libx11-dev libxi-dev libxtst-dev
@@ -204,3 +204,21 @@ git push
 - [ ] Corre app: `bun run tauri dev`
 - [ ] `.gitignore` bloquea artefactos pesados
 - [ ] `git status` muestra solo código/config/docs relevantes
+
+## 13) Estabilización Específica (Wayland, CUDA, PipeWire)
+
+La arquitectura de Veloce incluye estabilizaciones especiales necesarias para entornos Linux modernos:
+
+### Bloqueo de Atajos Globales en Wayland
+Como medida de seguridad, los compositores Wayland bloquean la lectura global del teclado a nivel de aplicación, inhabilitando los atajos de Tauri (`tauri-plugin-global-shortcut`). Para evadir este límite en Wayland sin requerir permisos de `root`:
+1. El backend en Rust levanta un **microservidor HTTP en segundo plano** local (puerto `41414`).
+2. El usuario debe configurar el atajo a **nivel del Sistema Operativo** (Ajustes de Kali / GNOME -> Teclado).
+3. El atajo nativo debe ejecutar el comando: `curl -s http://127.0.0.1:41414/toggle`.
+4. El servidor local en Rust recibe el comando y emite un evento `global-toggle-capture` al frontend React.
+
+### Minimización Inconsistente en Wayland
+Las animaciones de cierre (`Framer Motion`) provocan parpadeos y ventanas "fantasma" invisibles si el decorador de ventanas de Wayland redimensiona la aplicación *antes* de finalizar la animación. Se introdujo un delay asíncrono (`setTimeout` de 250ms) antes de aplicar un `window.setSize` minúsculo para permitir la salida limpia de los componentes.
+
+### Estabilización del Motor de Audio
+1. **Detección de Crash en PipeWire:** Se manejan excepciones para el error `PaErrorCode -9988` (Puntero de Stream Inválido) de PortAudio/PipeWire forzando un reinicio limpio del backend sin tirar la aplicación Rust.
+2. **Alucinaciones Whisper:** Al no inyectar ruido o voz, el modelo puede "alucinar" frases como *"¿qué es lo que se ha hablado?"* o *"gracias por ver el video"*. Esto se parcha mediante el diccionario `GRATITUDE_PHRASES` y limpieza por RegEx estricta en el bucle de transcripción final del Python intermedio.

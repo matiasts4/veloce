@@ -258,8 +258,27 @@ GRATITUDE_PHRASES = [
     "gracias",
     "muchas gracias",
     "gracias por ver",
+    "gracias por ver el video",
+    "gracias por ver el vídeo",
+    "gracias por su atención",
+    "gracias a todos",
+    "gracias amén",
+    "gracias. amén",
+    "gracias gracias",
+    "amén",
+    "y cosas así",
+    "y cosas asi",
+    "qué es lo que se ha hablado",
+    "que es lo que se ha hablado",
+    "amen",
+    "suscríbete",
+    "suscríbete a mi canal",
+    "suscríbanse",
+    "dale like",
+    "hasta la próxima",
     "thank you",
     "thanks",
+    "thank you for watching",
 ]
 
 # Globals
@@ -1750,17 +1769,24 @@ def start_input_stream(device_id, force_restart=False):
             emit({"error": f"Audio callback crashed: {e}"})
 
     if current_stream is not None and not force_restart:
-        if getattr(current_stream, 'active', False):
-            return
-        else:
-            emit({"log": "Existing stream is dead/inactive. Forcing restart."})
+        try:
+            if getattr(current_stream, 'active', False):
+                return
+            else:
+                emit({"log": "Existing stream is dead/inactive. Forcing restart."})
+        except Exception as e:
+            emit({"log": f"Stream active check failed: {e}. Forcing restart."})
 
     if current_stream is not None:
         try:
             current_stream.stop()
+        except Exception:
+            pass
+        try:
             current_stream.close()
         except Exception:
             pass
+        current_stream = None
 
     kwargs = {
         "callback": audio_callback,
@@ -2169,18 +2195,23 @@ def cleanup_transcription_text(text: str, duration_s: float) -> str:
 
     lowered = normalized.lower().strip(" .,!?:;¡!¿?\"'`[]()")
 
-    if duration_s <= 4.0 and lowered in GRATITUDE_PHRASES:
+    # Exact match for common hallucinations in chunks up to 12 seconds
+    if duration_s <= 12.0 and lowered in GRATITUDE_PHRASES:
         return ""
 
     words = normalized.split()
-    if len(words) >= 6:
+    # Check suffixes/prefixes if there's enough context (or any length really, whisper can append just one word)
+    if len(words) >= 2:
         for phrase in GRATITUDE_PHRASES:
-            prefix_pattern = re.compile(rf"^\s*{re.escape(phrase)}[\s\.,;:!\?¡¿-]+", re.IGNORECASE)
-            suffix_pattern = re.compile(rf"[\s\.,;:!\?¡¿-]+{re.escape(phrase)}\s*$", re.IGNORECASE)
+            prefix_pattern = re.compile(rf"^[\s\.,;:!\?¡¿-]*{re.escape(phrase)}[\s\.,;:!\?¡¿-]+", re.IGNORECASE)
+            suffix_pattern = re.compile(rf"[\s\.,;:!\?¡¿-]+{re.escape(phrase)}[\s\.,;:!\?¡¿-]*$", re.IGNORECASE)
 
-            if duration_s <= 10.0:
-                normalized = prefix_pattern.sub("", normalized).strip()
-                normalized = suffix_pattern.sub("", normalized).strip()
+            if duration_s <= 20.0:
+                old_norm = None
+                while old_norm != normalized:
+                    old_norm = normalized
+                    normalized = prefix_pattern.sub("", normalized).strip()
+                    normalized = suffix_pattern.sub("", normalized).strip()
 
     return normalized
 

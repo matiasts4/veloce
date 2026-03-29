@@ -3,7 +3,7 @@ from huggingface_hub import snapshot_download
 
 def main():
     print("Iniciando descarga manual del modelo large-v3-turbo (Formato CTranslate2 para faster-whisper)...")
-    repo_id = "deepdml/faster-whisper-large-v3-turbo"
+    repo_id = "deepdml/faster-whisper-large-v3-turbo-ct2"
     print(f"Repositorio: {repo_id}")
     
     try:

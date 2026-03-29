@@ -71,6 +71,28 @@ fn main() {
                     }
                 }
             });
+
+            // Start stealth local HTTP server for Wayland global shortcut bypass
+            let app_handle_server = app_handle.clone();
+            std::thread::spawn(move || {
+                if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:41414") {
+                    for stream in listener.incoming() {
+                        if let Ok(mut stream) = stream {
+                            let mut buffer = [0; 512];
+                            if let Ok(bytes_read) = std::io::Read::read(&mut stream, &mut buffer) {
+                                if bytes_read > 0 {
+                                    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                                    if request.starts_with("GET /toggle ") || request.starts_with("POST /toggle ") {
+                                        let _ = app_handle_server.emit("global-toggle-capture", ());
+                                        let response = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK";
+                                        let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
             
             // Register Shortcuts
             let shortcut_focus = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyV);
