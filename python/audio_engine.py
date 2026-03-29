@@ -1922,19 +1922,7 @@ class StreamProcessor:
         if is_final_flush:
             self.speech_buffer = []
         else:
-            # Ovelap: keep the last 1.5 seconds of audio to give whisper context for the next phrase
-            overlap_seconds = 1.5
-            overlap_samples = int(overlap_seconds * self.sample_rate)
-            if len(full_audio) > overlap_samples:
-                overlap_audio = full_audio[-overlap_samples:]
-                # Reconstruct buffer from the overlap
-                self.speech_buffer = []
-                for i in range(0, len(overlap_audio), self.chunk_size):
-                    chunk = overlap_audio[i:i+self.chunk_size]
-                    if len(chunk) == self.chunk_size:
-                        self.speech_buffer.append(chunk)
-            else:
-                self.speech_buffer = []
+            self.speech_buffer = []
             
         self.accumulated_audio_duration = 0
         self.last_partial_time = 0

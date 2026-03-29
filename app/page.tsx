@@ -257,7 +257,7 @@ export default function VelocePage() {
             await window.setAlwaysOnTop(true);
             setTimeout(async () => {
               await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
-            }, 250);
+            }, 50);
           })
           .catch((error) => console.error("Failed to minimize from hotkey", error));
       });
@@ -276,7 +276,7 @@ export default function VelocePage() {
           const { LogicalSize } = dpiApi;
           const window = getCurrentWindow();
           const target = getExpandedWindowSize();
-          await window.setAlwaysOnTop(false);
+          await window.setAlwaysOnTop(true);
           await window.setSize(new LogicalSize(target.width, target.height));
         })
         .catch((error) => console.error("Failed to restore from hotkey", error));
@@ -300,7 +300,7 @@ export default function VelocePage() {
           await window.setAlwaysOnTop(true);
           setTimeout(async () => {
             await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
-          }, 250);
+          }, 50);
         })
         .catch((error) => console.error("Failed to minimize to mini widget", error));
     });
@@ -319,7 +319,7 @@ export default function VelocePage() {
           const { LogicalSize } = dpiApi;
           const window = getCurrentWindow();
           const target = getExpandedWindowSize();
-          await window.setAlwaysOnTop(false);
+          await window.setAlwaysOnTop(true);
           await window.setResizable(true);
           await window.setMaximizable(true);
           await window.setSize(new LogicalSize(target.width, target.height));
@@ -473,6 +473,21 @@ export default function VelocePage() {
           } else if (event.payload === "stopped") {
             // Note: with the async queue, "stopped" only arrives when all background transcriptions
             // are thoroughly flushed. Therefore, we can confidently reset to idle without cutting off text.
+            const fullText = sessionTranscriptRef.current.trim();
+            if (fullText && clipboardModeRef.current) {
+              if (clipboardAutoPasteRef.current) {
+                import("@/lib/tauri-client").then(({ safeInvoke }) => {
+                  safeInvoke("set_clipboard", { text: fullText })
+                    .then(() => safeInvoke("press_paste_shortcut"))
+                    .catch(console.error);
+                });
+              } else {
+                import("@/lib/tauri-client").then(({ safeInvoke }) => {
+                  safeInvoke("set_clipboard", { text: fullText });
+                });
+              }
+            }
+
             setStatus("idle");
             setIsActive(false);
           } else if (event.payload === "transcribing") {
@@ -624,30 +639,14 @@ export default function VelocePage() {
             return chunk;
           });
 
-          // Output actions: type/clipboard only for final segments, using phrase_text (just the new phrase)
-          if (isFinal && text.trim()) {
-            const phraseText = (typeof payload === "object" && payload !== null && (payload as Record<string, unknown>)?.phrase_text)
-              ? String((payload as Record<string, unknown>).phrase_text).trim()
-              : text.trim();
-            const textToOutput = phraseText;
-            if (clipboardModeRef.current) {
-              if (clipboardAutoPasteRef.current) {
-                import("@/lib/tauri-client").then(({ safeInvoke }) => {
-                  safeInvoke("set_clipboard", { text: textToOutput })
-                    .then(() => safeInvoke("press_paste_shortcut"))
-                    .catch(console.error);
-                });
-              } else {
-                import("@/lib/tauri-client").then(({ safeInvoke }) => {
-                  safeInvoke("set_clipboard", { text });
-                });
-              }
-            } else {
-              import("@/lib/tauri-client").then(({ safeInvoke }) => {
-                safeInvoke("type_text", { text: ` ${textToOutput}` }).catch(console.error);
-              });
-            }
+          // Continuously save the cumulative text to the ref so we can safely paste it all when recording STOPS
+          if (text.trim()) {
+            sessionTranscriptRef.current = text.trim();
           }
+
+          // Output actions: type/clipboard only for final segments, using phrase_text (just the new phrase)
+          // Removed per-segment auto-pasting logic to prevent double pasting and "intelligent" pasting.
+          // Auto-pasting is now handled exactly once when the user manually stops the session (status: "stopped").
           if (typeof responseMs === "number") {
             setLastResponseMs(Math.max(0, Math.round(responseMs)));
           }
@@ -1336,7 +1335,7 @@ export default function VelocePage() {
               <div
                 data-tauri-drag-region
                 className="flex items-center gap-3.5 py-1"
-                onClick={handleRestoreFromMiniWidget}
+                onDoubleClick={handleRestoreFromMiniWidget}
               >
                 <div className="flex items-center gap-[1.8px] pointer-events-none">
                   {[0, 1, 2, 3, 4, 5].map((i) => (

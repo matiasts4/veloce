@@ -222,3 +222,11 @@ Las animaciones de cierre (`Framer Motion`) provocan parpadeos y ventanas "fanta
 ### Estabilización del Motor de Audio
 1. **Detección de Crash en PipeWire:** Se manejan excepciones para el error `PaErrorCode -9988` (Puntero de Stream Inválido) de PortAudio/PipeWire forzando un reinicio limpio del backend sin tirar la aplicación Rust.
 2. **Alucinaciones Whisper:** Al no inyectar ruido o voz, el modelo puede "alucinar" frases como *"¿qué es lo que se ha hablado?"* o *"gracias por ver el video"*. Esto se parcha mediante el diccionario `GRATITUDE_PHRASES` y limpieza por RegEx estricta en el bucle de transcripción final del Python intermedio.
+3. **Repeticiones (Ecos) de Final de Frase:** La función nativa de retener 1.5 segundos de "overlap" (solapamiento) de audio para contextualizar a Whisper causaba una duplicación física de los bytes de la última palabra hablada tras dispararse el Voice Activity Detection (VAD). Este buffer fue vaciado completamente a cero, permitiendo que la transición a texto ocurra limpiamente.
+
+### Restricciones "Always On Top" en GNOME Wayland
+Los compositores modernos de Wayland (especialmente Mutter en GNOME/Kali) bloquean activamente cualquier intento programático de fijar una ventana superpuesta (`setAlwaysOnTop`) si no cuenta con decoraciones o con rol asignado por sistema.
+- **Solución implementada:** Se inyectó dinámicamente la variable de entorno `std::env::set_var("GDK_BACKEND", "x11");` en el punto de entrada de la aplicación en Rust (`src-tauri/src/main.rs`). Esto obliga a Tauri y WebKitGTK a operar en capa **XWayland (emulador X11)**, permitiendo saltarse las restricciones estrictas de Wayland y validando correctamente las ventanas siempre al frente.
+
+### UX (Experiencia de Usuario) Minimizado
+Debido a la naturaleza compartida de los eventos del ratón (Drag & Drop vs Clics) en marcos WebView sin decoraciones, la acción de sujetar el widget flotante con clics para moverlo (`data-tauri-drag-region`) detonaba accidentalmente el evento de expansión global `onClick` en DOM al soltarse. Se reemplazó estandarizadamente a interacción del tipo `onDoubleClick`, imitando el comportamiento nativo de widgets de sistema de Linux y macOS.

@@ -16,6 +16,13 @@ use state::{AppState, EngineSettings};
 use shortcuts::HotkeyConfig;
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    {
+        // Enforce X11 backend on Linux to bypass Wayland's strict window management restrictions,
+        // which completely block frameless transparent windows from staying always on top.
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
