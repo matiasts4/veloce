@@ -10,9 +10,11 @@ import { TitleBar } from "@/components/veloce/title-bar";
 import { MicButton } from "@/components/veloce/mic-button";
 import { StatusPill } from "@/components/veloce/status-pill";
 import { SettingsPage } from "@/components/veloce/settings-page";
+import { VUMeter } from "@/components/VUMeter";
 import { LibraryView } from "@/components/veloce/library-view";
 import { ModelsManager } from "@/components/veloce/models-manager";
 import { StartupOverlay } from "@/components/veloce/startup-overlay"; // Import Overlay
+import { MiniVUBars } from "@/components/veloce/mini-vu-bars";
 import { saveTranscription } from "@/lib/store";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
@@ -1159,6 +1161,9 @@ export default function VelocePage() {
             {view === "recorder" ? (
               <div className="flex h-[calc(100%-4.75rem)] w-full flex-col items-center">
                 <MicButton isActive={isActive} status={status} onToggle={handleToggleCapture} />
+                <div className={`mt-5 -mb-2 w-full flex justify-center h-1.5 transition-opacity duration-300 ${status === "listening" ? "opacity-100" : "opacity-0"}`}>
+                  <VUMeter />
+                </div>
                 <StatusPill status={status} uiLanguage={uiLanguage} />
                 <div className="mt-2 flex w-full flex-1 px-4 pb-4">
                   <div className="flex h-full min-h-[11rem] w-full flex-col rounded-md border border-border/60 bg-secondary/30 px-3 py-2">
@@ -1328,35 +1333,30 @@ export default function VelocePage() {
             className="absolute left-0 top-0 z-50 flex h-full w-full items-center justify-center p-3"
           >
             <div
-              className={`group relative flex h-11 w-fit min-w-[170px] cursor-grab items-center rounded-full border border-border/80 bg-card px-5 shadow-xl transition-all duration-500 active:cursor-grabbing ${miniIsListening ? "border-primary/40 shadow-[0_0_15px_rgba(37,99,235,0.15)] ring-1 ring-primary/20" : "hover:border-border"}`}
+              className={`group relative flex h-11 w-fit min-w-[170px] cursor-grab items-center rounded-full border border-border/80 bg-card px-5 shadow-xl transition-all duration-500 active:cursor-grabbing overflow-hidden ${
+                status === "listening" 
+                  ? "border-primary/40 shadow-[0_0_15px_rgba(37,99,235,0.15)] ring-1 ring-primary/20" 
+                  : status === "transcribing"
+                  ? "border-cyan-400/40 shadow-[0_0_15px_rgba(34,211,238,0.15)] ring-1 ring-cyan-400/20"
+                  : status === "processing"
+                  ? "border-amber-500/40 shadow-[0_0_15px_rgba(245,158,11,0.15)] ring-1 ring-amber-500/20"
+                  : "hover:border-border"
+              }`}
               data-tauri-drag-region
             >
               {/* Main Content Area */}
               <div
                 data-tauri-drag-region
-                className="flex items-center gap-3.5 py-1"
+                className="flex items-center gap-3.5 py-1 z-10 w-full"
                 onDoubleClick={handleRestoreFromMiniWidget}
               >
-                <div className="flex items-center gap-[1.8px] pointer-events-none">
-                  {[0, 1, 2, 3, 4, 5].map((i) => (
-                    <motion.span
-                      key={i}
-                      className={`w-[2.5px] rounded-full ${miniIsListening ? "bg-primary" : "bg-muted-foreground/30"}`}
-                      animate={miniIsListening ? {
-                        height: [5, 14, 7, 16, 5],
-                      } : {
-                        height: 7
-                      }}
-                      transition={{
-                        duration: 1.2 + (i * 0.15),
-                        repeat: Infinity,
-                        delay: i * 0.1,
-                        ease: "easeInOut",
-                      }}
-                    />
-                  ))}
-                </div>
-                <span className={`pointer-events-none font-mono text-[10px] font-medium uppercase tracking-widest transition-colors ${miniIsListening ? "text-primary/90" : "text-muted-foreground"}`}>
+                <MiniVUBars status={status} />
+                <span className={`pointer-events-none font-mono text-[10px] font-medium uppercase tracking-widest transition-colors duration-500 ${
+                  status === "listening" ? "text-primary/90" : 
+                  status === "transcribing" ? "text-cyan-400/90" : 
+                  status === "processing" ? "text-amber-500/90" : 
+                  "text-muted-foreground"
+                }`}>
                   {showMiniDoneTick ? t("mini.ready") : t("mini.recorder")}
                 </span>
               </div>
@@ -1372,7 +1372,7 @@ export default function VelocePage() {
                     console.error("Failed to close app", error);
                   }
                 }}
-                className="absolute right-0 top-0 flex h-5 w-5 scale-0 items-center justify-center rounded-full bg-muted/20 text-muted-foreground opacity-0 shadow-sm transition-all duration-300 group-hover:scale-100 group-hover:opacity-100 hover:bg-destructive hover:text-white"
+                className="absolute right-0 top-0 z-20 flex h-5 w-5 scale-0 items-center justify-center rounded-full bg-muted/20 text-muted-foreground opacity-0 shadow-sm transition-all duration-300 group-hover:scale-100 group-hover:opacity-100 hover:bg-destructive hover:text-white"
                 aria-label={t("mini.close_mini_widget")}
               >
                 <X className="h-3 w-3 stroke-[2.5]" />

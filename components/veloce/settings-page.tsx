@@ -62,7 +62,7 @@ interface SettingsPageProps {
   onToggleCaptureComboChange: (combo: HotkeyCombo | null) => void;
   onRecordingChange: (recording: boolean) => void;
   // Dynamic Data
-  availableMics: { id: number; name: string }[];
+  availableMics: { id: number | string; name: string }[];
   gpuInfo: { available: boolean; name: string; reason?: string };
   availableBackends: { id: "auto" | "faster-whisper" | "whispercpp"; available: boolean; reason?: string }[];
   downloadedModels: { id: string; name: string; downloaded?: boolean }[];

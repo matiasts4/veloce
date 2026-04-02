@@ -39,6 +39,8 @@ struct SidecarMessage {
     model: Option<String>,
     #[serde(default)]
     progress: Option<u8>,
+    #[serde(default)]
+    vu_meter: Option<serde_json::Value>,
 }
 
 pub fn ensure_embedded_audio_engine_script<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
@@ -281,6 +283,9 @@ pub async fn spawn_audio_engine<R: Runtime>(
                         }
                         if let Some(status) = msg.status {
                             let _ = app_handle_clone.emit("status-update", status);
+                        }
+                        if let Some(vu) = msg.vu_meter {
+                            let _ = app_handle_clone.emit("vu-update", vu);
                         }
                         // Pass through hardware/model info
                         if let Some(msg_type) = msg.msg_type {

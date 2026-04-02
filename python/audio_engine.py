@@ -1762,9 +1762,10 @@ def start_input_stream(device_id, force_restart=False):
     
     # We will instantiate a resampler lazily to avoid overhead if not needed
     resampler = None
+    vu_last_emit = 0.0
 
     def audio_callback(indata, frames, callback_time, status):
-        nonlocal resampler
+        nonlocal resampler, vu_last_emit
         global recording
         try:
             if status:
@@ -1784,6 +1785,13 @@ def start_input_stream(device_id, force_restart=False):
                 chunk_tensor = torch.from_numpy(chunk).float().T # [channels, time]
                 chunk_tensor = resampler(chunk_tensor)
                 chunk = chunk_tensor.T.numpy().astype(np.int16)
+
+            # VU Meter emit
+            now = time.time()
+            if now - vu_last_emit >= 1.0 / 15.0:
+                rms = float(np.sqrt(np.mean(chunk.astype(np.float32)**2)))
+                emit({"vu_meter": {"rms": rms}})
+                vu_last_emit = now
 
             with pre_roll_lock:
                 pre_roll_chunks.append(chunk)
