@@ -13,7 +13,34 @@ import re
 import urllib.request
 import urllib.error
 import io
+import os
+from pathlib import Path
 from collections import deque
+
+
+def configure_windows_cuda_dll_paths():
+    if os.name != "nt":
+        return
+
+    site_packages_root = Path(sys.executable).parent / "Lib" / "site-packages"
+    candidates = [
+        site_packages_root / "torch" / "lib",
+        site_packages_root / "nvidia" / "cublas" / "bin",
+        site_packages_root / "nvidia" / "cudnn" / "bin",
+        site_packages_root / "nvidia" / "cuda_runtime" / "bin",
+        site_packages_root / "nvidia" / "cuda_nvrtc" / "bin",
+    ]
+
+    for dll_dir in candidates:
+        try:
+            if dll_dir.exists() and dll_dir.is_dir():
+                os.add_dll_directory(str(dll_dir))
+        except Exception:
+            pass
+
+
+configure_windows_cuda_dll_paths()
+
 import numpy as np
 import sounddevice as sd
 from queue import Queue, Empty
@@ -22,8 +49,6 @@ from huggingface_hub import HfApi, snapshot_download
 from tqdm.auto import tqdm
 import torch
 import torchaudio
-import os
-from pathlib import Path
 import logging
 import datetime
 import atexit
@@ -257,6 +282,8 @@ WHISPERCPP_SERVER_HEALTH_TIMEOUT = 30.0
 GRATITUDE_PHRASES = [
     "gracias",
     "muchas gracias",
+    "un saludo",
+    "saludos",
     "gracias por ver",
     "gracias por ver el video",
     "gracias por ver el vídeo",
@@ -279,6 +306,24 @@ GRATITUDE_PHRASES = [
     "thank you",
     "thanks",
     "thank you for watching",
+]
+
+# Phrases that frequently appear as hallucinated openings/closings in short chunks.
+# Keep this list conservative to avoid deleting valid sentence content.
+EDGE_HALLUCINATION_PHRASES = [
+    "gracias",
+    "muchas gracias",
+    "un saludo",
+    "saludos",
+    "gracias a todos",
+    "gracias por su atencion",
+    "gracias por su atención",
+    "hasta la proxima",
+    "hasta la próxima",
+    "al final",
+    "gracias gracias",
+    "thank you",
+    "thanks",
 ]
 
 # Globals
@@ -1512,11 +1557,6 @@ def load_whisper(model_name, prefer_gpu):
     try:
         with model_lock:
             previous_model = model_whisper
-            model_whisper = None
-
-        if previous_model is not None:
-            del previous_model
-            gc.collect()
 
         target_path = model_name
         
@@ -1535,8 +1575,15 @@ def load_whisper(model_name, prefer_gpu):
         num_workers = min(2, cpu_count // 2)
         emit({"log": f"Loading WhisperModel: {target_path} | device={device} compute={compute_type} threads={cpu_threads} workers={num_workers}"})
         loaded = WhisperModel(target_path, device=device, compute_type=compute_type, cpu_threads=cpu_threads, num_workers=num_workers)
+
+        # Swap model atomically only after new model is fully loaded.
         with model_lock:
+            old_model = model_whisper
             model_whisper = loaded
+        if old_model is not None and old_model is not loaded:
+            del old_model
+            gc.collect()
+
         load_uuid = str(uuid.uuid4())[:6]
         emit({"status": "ready"})
         emit({"log": f"Model loaded [{load_uuid}]: {model_name} on {device}"})
@@ -1898,7 +1945,8 @@ class StreamProcessor:
         
         # Tuning parameters
         self.min_speech_duration_ms = 150 # Reduced to catch short words like "Hi"
-        self.min_silence_duration_ms = 1200  # Increased to prevent micro-fragmentation
+        self.min_silence_duration_ms = 650  # Lower latency while preserving phrase grouping
+        self.max_segment_duration_s = 3.2   # Force flush in continuous/noisy speech to avoid 20s delays
         self.speech_pad_ms = 100  
         
         self.accumulated_audio_duration = 0
@@ -1931,6 +1979,12 @@ class StreamProcessor:
         if self.is_speech_active:
             self.speech_buffer.append(audio_chunk)
             self.accumulated_audio_duration += len(audio_chunk) / self.sample_rate
+
+            # Force periodic segmentation even without full silence.
+            if self.accumulated_audio_duration >= self.max_segment_duration_s:
+                emit({"log": f"Forcing segment flush at {self.accumulated_audio_duration:.2f}s for low-latency transcription"})
+                self.finalize_segment()
+                return
             
             # Check for silence timeout -> Finalize
             if self.silence_counter > self.min_silence_duration_ms:
@@ -1974,6 +2028,7 @@ class StreamProcessor:
             
         self.accumulated_audio_duration = 0
         self.last_partial_time = 0
+        self.silence_counter = 0
         
         # if recording:
         #     emit({"status": "listening"}) 
@@ -1994,7 +2049,7 @@ class StreamProcessor:
         # We don't put partials in the queue to avoid blocking finals
         threading.Thread(target=transcribe_segment, args=(current_audio, False), daemon=True).start()
 
-def transcribe_segment(audio_data, is_final=False):
+def transcribe_segment(audio_data, is_final=False, retry_on_cpu=True):
     # This replaces the old transcribe() function logic but adapted
     global current_recording_id, diarization_manager
     
@@ -2051,6 +2106,16 @@ def transcribe_segment(audio_data, is_final=False):
         model = model_whisper
     
     if model is None:
+        # If a model is currently loading, wait briefly before dropping the segment.
+        if model_load_lock.locked():
+            for _ in range(20):
+                time.sleep(0.1)
+                with model_lock:
+                    model = model_whisper
+                if model is not None:
+                    break
+
+    if model is None:
         emit({"error": "Model not loaded. Cannot transcribe. Check model selection and GPU settings."})
         return
 
@@ -2097,6 +2162,32 @@ def transcribe_segment(audio_data, is_final=False):
             })
             
     except Exception as e:
+        error_text = str(e)
+
+        # Common Windows CUDA runtime failures (missing cuBLAS/cuDNN DLLs).
+        # If this happens, switch to CPU automatically and retry once.
+        cuda_runtime_markers = [
+            "cublas64_12.dll",
+            "cudnn",
+            "cuda",
+            "cannot be loaded",
+            "loadlibrary",
+        ]
+        is_cuda_runtime_error = any(marker in error_text.lower() for marker in cuda_runtime_markers)
+
+        if retry_on_cpu and active_backend == "faster-whisper" and is_cuda_runtime_error:
+            emit({"error": "CUDA runtime error during transcription. large-v3-turbo on GPU is required but CUDA libraries are unavailable."})
+
+            # Retry once with the same requested configuration in case runtime paths were updated.
+            reloaded = load_backend(selected_model, gpu_enabled, selected_backend)
+            if reloaded:
+                try:
+                    # Retry once with the same model/backend setup.
+                    transcribe_segment(audio_data, is_final=is_final, retry_on_cpu=False)
+                    return
+                except Exception:
+                    pass
+
         emit({"error": f"Transcribe error: {e}"})
 
 def transcription_worker():
@@ -2231,8 +2322,8 @@ def cleanup_transcription_text(text: str, duration_s: float) -> str:
 
     lowered = normalized.lower().strip(" .,!?:;¡!¿?\"'`[]()")
 
-    # Exact match for common hallucinations in chunks up to 12 seconds
-    if duration_s <= 12.0 and lowered in GRATITUDE_PHRASES:
+    # Exact match for common hallucinations in short chunks.
+    if duration_s <= 20.0 and (lowered in GRATITUDE_PHRASES or lowered in EDGE_HALLUCINATION_PHRASES):
         return ""
 
     words = normalized.split()
@@ -2242,12 +2333,25 @@ def cleanup_transcription_text(text: str, duration_s: float) -> str:
             prefix_pattern = re.compile(rf"^[\s\.,;:!\?¡¿-]*{re.escape(phrase)}[\s\.,;:!\?¡¿-]+", re.IGNORECASE)
             suffix_pattern = re.compile(rf"[\s\.,;:!\?¡¿-]+{re.escape(phrase)}[\s\.,;:!\?¡¿-]*$", re.IGNORECASE)
 
-            if duration_s <= 20.0:
+            if duration_s <= 24.0:
                 old_norm = None
                 while old_norm != normalized:
                     old_norm = normalized
                     normalized = prefix_pattern.sub("", normalized).strip()
                     normalized = suffix_pattern.sub("", normalized).strip()
+
+    # Remove frequent hallucinated tail/opening chunks (e.g. "un saludo", "al final")
+    # only when they are detached at the edges of short segments.
+    if duration_s <= 18.0:
+        for phrase in EDGE_HALLUCINATION_PHRASES:
+            edge_prefix = re.compile(rf"^[\s\.,;:!\?¡¿\-\"]*{re.escape(phrase)}[\s\.,;:!\?¡¿\-\"]+", re.IGNORECASE)
+            edge_suffix = re.compile(rf"[\s\.,;:!\?¡¿\-\"]+{re.escape(phrase)}[\s\.,;:!\?¡¿\-\"]*$", re.IGNORECASE)
+
+            previous = None
+            while previous != normalized:
+                previous = normalized
+                normalized = edge_prefix.sub("", normalized).strip()
+                normalized = edge_suffix.sub("", normalized).strip()
 
     return normalized
 
@@ -2393,6 +2497,18 @@ def command_listener():
                 # Sanitize model name: __custom_file__ is invalid, use default
                 if model == "__custom_file__" or not model or model.startswith("__"):
                     model = "large-v3-turbo"
+
+                # Quality policy: when GPU is enabled and large-v3-turbo is available,
+                # avoid staying on tiny due stale UI state from previous fallback tests.
+                if prefer_gpu and model == "tiny":
+                    try:
+                        downloaded = get_downloaded_models()
+                        has_large_turbo = any(item.get("id") == "large-v3-turbo" and item.get("downloaded", True) for item in downloaded)
+                        if has_large_turbo:
+                            emit({"log": "GPU mode active: promoting model from tiny to large-v3-turbo for better quality."})
+                            model = "large-v3-turbo"
+                    except Exception:
+                        pass
 
                 # Sanitize model_dir: ignore it if it doesn't exist or has no models
                 if model_dir and model_dir not in ("__default__", ""):

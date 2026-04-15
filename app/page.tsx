@@ -45,8 +45,8 @@ const NORMAL_WIDTH = 500;
 const NORMAL_HEIGHT = 620;
 const LARGE_WIDTH = 700;
 const LARGE_HEIGHT = 640;
-const MINI_WIDTH = 184;
-const MINI_HEIGHT = 56;
+const MINI_WIDTH = 224;
+const MINI_HEIGHT = 68;
 // Minimum time to show the loading screen to mask backend instability (ms)
 const MIN_BOOT_TIME_MS = 3500;
 
@@ -60,7 +60,7 @@ const DEFAULT_TOGGLE_WIDGET: HotkeyCombo = {
 
 const DEFAULT_TOGGLE_CAPTURE: HotkeyCombo = {
   key: " ",
-  ctrlKey: true,
+  ctrlKey: false,
   shiftKey: false,
   altKey: false,
   metaKey: false,
@@ -301,6 +301,29 @@ export default function VelocePage() {
     [expandedViewSize]
   );
 
+  const dockMiniWidgetWindow = useCallback(async () => {
+    const [{ getCurrentWindow }, { LogicalPosition, LogicalSize }] = await Promise.all([
+      import("@tauri-apps/api/window"),
+      import("@tauri-apps/api/dpi"),
+    ]);
+
+    const window = getCurrentWindow();
+    await window.setAlwaysOnTop(true);
+    await window.setResizable(false);
+    await window.setMaximizable(false);
+    await window.setSkipTaskbar(true);
+    await window.show();
+    await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
+
+    const monitor = await window.currentMonitor();
+    if (monitor) {
+      const margin = 12;
+      const x = monitor.position.x + monitor.size.width - MINI_WIDTH - margin;
+      const y = monitor.position.y + monitor.size.height - MINI_HEIGHT - margin;
+      await window.setPosition(new LogicalPosition(x, y));
+    }
+  }, []);
+
   // Toggle widget between normal and mini mode
   const handleToggleVisibility = useCallback(() => {
     if (isVisible) {
@@ -320,10 +343,8 @@ export default function VelocePage() {
                 await window.hide();
               }, 50);
             } else {
-              const { LogicalSize } = dpiApi;
-              await window.setAlwaysOnTop(true);
               setTimeout(async () => {
-                await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
+                await dockMiniWidgetWindow();
               }, 50);
             }
           })
@@ -353,7 +374,7 @@ export default function VelocePage() {
         })
         .catch((error) => console.error("Failed to restore from hotkey", error));
     });
-  }, [getExpandedWindowSize, isVisible, showFloatingWidget]);
+  }, [dockMiniWidgetWindow, getExpandedWindowSize, isVisible, showFloatingWidget]);
 
   const handleMinimizeToMiniWidget = useCallback(() => {
     setIsVisible(false);
@@ -372,18 +393,14 @@ export default function VelocePage() {
               await window.hide();
             }, 50);
           } else {
-            const { LogicalSize } = dpiApi;
-            await window.setResizable(false);
-            await window.setMaximizable(false);
-            await window.setAlwaysOnTop(true);
             setTimeout(async () => {
-              await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
+              await dockMiniWidgetWindow();
             }, 50);
           }
         })
         .catch((error) => console.error("Failed to minimize to mini widget", error));
     });
-  }, [showFloatingWidget]);
+  }, [dockMiniWidgetWindow, showFloatingWidget]);
 
   const handleRestoreFromMiniWidget = useCallback(() => {
     setIsVisible(true);
@@ -906,8 +923,12 @@ export default function VelocePage() {
         if (typeof saved.clipboardMode === "boolean") setClipboardMode(saved.clipboardMode);
         if (typeof saved.clipboardAutoPaste === "boolean") setClipboardAutoPaste(saved.clipboardAutoPaste);
         if (typeof saved.showResponseTimes === "boolean") setShowResponseTimes(saved.showResponseTimes);
-        if (saved.toggleWidgetCombo === null || typeof saved.toggleWidgetCombo === "object") setToggleWidgetCombo(saved.toggleWidgetCombo ?? null);
-        if (saved.toggleCaptureCombo === null || typeof saved.toggleCaptureCombo === "object") setToggleCaptureCombo(saved.toggleCaptureCombo ?? null);
+        if (saved.toggleWidgetCombo === null || typeof saved.toggleWidgetCombo === "object") {
+          setToggleWidgetCombo(saved.toggleWidgetCombo ?? DEFAULT_TOGGLE_WIDGET);
+        }
+        if (saved.toggleCaptureCombo === null || typeof saved.toggleCaptureCombo === "object") {
+          setToggleCaptureCombo(saved.toggleCaptureCombo ?? DEFAULT_TOGGLE_CAPTURE);
+        }
       }
     } catch (error) {
       console.error("Failed to load settings", error);
@@ -1071,6 +1092,21 @@ export default function VelocePage() {
     if (!settingsLoaded || !toggleCaptureCombo) return;
     setCaptureShortcutType(inferShortcutType(toggleCaptureCombo));
   }, [settingsLoaded, toggleCaptureCombo]);
+
+  // If capture type is "single", normalize any existing combo to a single key.
+  useEffect(() => {
+    if (!settingsLoaded || captureShortcutType !== "single" || !toggleCaptureCombo) return;
+
+    if (toggleCaptureCombo.ctrlKey || toggleCaptureCombo.shiftKey || toggleCaptureCombo.altKey || toggleCaptureCombo.metaKey) {
+      setToggleCaptureCombo({
+        key: toggleCaptureCombo.key,
+        ctrlKey: false,
+        shiftKey: false,
+        altKey: false,
+        metaKey: false,
+      });
+    }
+  }, [captureShortcutType, settingsLoaded, toggleCaptureCombo]);
 
   useEffect(() => {
     if (!settingsLoaded) return;
@@ -1455,7 +1491,7 @@ export default function VelocePage() {
             className="absolute left-0 top-0 z-50 flex h-full w-full items-center justify-center"
           >
             <div
-              className={`group relative flex items-center gap-2.5 cursor-grab rounded-full border px-4 py-2 shadow-2xl backdrop-blur-md transition-all duration-300 active:cursor-grabbing select-none ${
+              className={`group relative flex items-center gap-2.5 cursor-grab rounded-full border px-5 py-3 shadow-2xl backdrop-blur-md transition-all duration-300 active:cursor-grabbing select-none ${
                 status === "listening"
                   ? "border-primary/50 bg-primary/10 shadow-[0_4px_24px_rgba(37,99,235,0.25)] ring-1 ring-primary/20"
                   : status === "transcribing"
@@ -1477,7 +1513,7 @@ export default function VelocePage() {
 
               {/* Status label */}
               <span
-                className={`relative z-10 pointer-events-none font-mono text-[9px] font-semibold uppercase tracking-[0.15em] transition-colors duration-300 ${
+                className={`relative z-10 pointer-events-none font-mono text-[11px] font-semibold uppercase tracking-[0.14em] transition-colors duration-300 ${
                   status === "listening" ? "text-primary" :
                   status === "transcribing" ? "text-cyan-400" :
                   status === "processing" ? "text-amber-500" :
@@ -1508,10 +1544,10 @@ export default function VelocePage() {
                     console.error("Failed to close app", error);
                   }
                 }}
-                className="relative z-20 ml-0.5 flex h-4 w-4 scale-0 items-center justify-center rounded-full bg-muted/30 text-muted-foreground opacity-0 transition-all duration-200 group-hover:scale-100 group-hover:opacity-100 hover:bg-destructive/80 hover:text-white"
+                className="relative z-20 ml-1 flex h-5 w-5 scale-0 items-center justify-center rounded-full bg-muted/30 text-muted-foreground opacity-0 transition-all duration-200 group-hover:scale-100 group-hover:opacity-100 hover:bg-destructive/80 hover:text-white"
                 aria-label={t("mini.close_mini_widget")}
               >
-                <X className="h-2.5 w-2.5 stroke-[2.5]" />
+                <X className="h-3 w-3 stroke-[2.5]" />
               </button>
             </div>
           </motion.div>

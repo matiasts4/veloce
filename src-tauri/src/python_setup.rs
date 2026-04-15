@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 use tauri::AppHandle;
 use tauri::Manager;
 use tauri::Emitter;
@@ -15,6 +17,126 @@ const PYTHON_DIR_NAME: &str = "python-embed";
 const REQUIREMENTS_FILE_NAME: &str = "requirements.txt";
 
 #[cfg(target_os = "windows")]
+fn locate_resource_candidate<R: Runtime>(app: &AppHandle<R>, relative_name: &str) -> Option<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(resources_dir) = app.path().resource_dir() {
+        paths.push(resources_dir.join(relative_name));
+    }
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            paths.push(exe_dir.join(relative_name));
+            paths.push(exe_dir.join("resources").join(relative_name));
+        }
+    }
+    paths.into_iter().find(|p| p.exists())
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_pip_available<R: Runtime>(app: &AppHandle<R>, python_exe: &Path, python_dir: &Path) -> Result<(), String> {
+    let pip_status = Command::new(python_exe)
+        .args(["-m", "pip", "--version"])
+        .status()
+        .map_err(|e| format!("Failed to check pip: {}", e))?;
+
+    if pip_status.success() {
+        return Ok(());
+    }
+
+    emit_log(app, "pip not found. Installing pip...");
+    let bundled_pip = locate_resource_candidate(app, "get-pip.py")
+        .ok_or_else(|| "Bundled get-pip.py not found.".to_string())?;
+
+    let get_pip_path = python_dir.join("get-pip.py");
+    fs::copy(&bundled_pip, &get_pip_path)
+        .map_err(|e| format!("Failed to copy get-pip.py: {}", e))?;
+
+    let output = Command::new(python_exe)
+        .arg(&get_pip_path)
+        .output()
+        .map_err(|e| format!("Failed to execute get-pip.py: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to install pip. Output: {}", stderr));
+    }
+
+    emit_log(app, "Pip installed successfully.");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_python_dependencies<R: Runtime>(app: &AppHandle<R>, python_exe: &Path, python_dir: &Path) -> Result<(), String> {
+    let missing_check = Command::new(python_exe)
+        .args([
+            "-c",
+            "import importlib.util as u; mods=['numpy','sounddevice','faster_whisper','huggingface_hub','tqdm','yaml','torch','torchaudio']; print(','.join([m for m in mods if u.find_spec(m) is None]))",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to validate python dependencies: {}", e))?;
+
+    let missing_modules = String::from_utf8_lossy(&missing_check.stdout)
+        .trim()
+        .split(',')
+        .filter(|m| !m.trim().is_empty())
+        .map(|m| m.trim().to_string())
+        .collect::<Vec<String>>();
+
+    if missing_modules.is_empty() {
+        return Ok(());
+    }
+
+    emit_log(app, "Python dependencies missing or incomplete. Repairing environment...");
+    ensure_pip_available(app, python_exe, python_dir)?;
+
+    let mut packages: Vec<&str> = Vec::new();
+    for module in &missing_modules {
+        match module.as_str() {
+            "numpy" => packages.push("numpy==2.2.3"),
+            "sounddevice" => packages.push("sounddevice==0.5.1"),
+            "faster_whisper" => packages.push("faster-whisper==1.1.1"),
+            "huggingface_hub" => packages.push("huggingface-hub==0.28.1"),
+            "tqdm" => packages.push("tqdm==4.67.1"),
+            "yaml" => packages.push("pyyaml"),
+            // Use CPU defaults for repair path; GPU-specific wheels can still be installed manually.
+            "torch" => packages.push("torch==2.6.0"),
+            "torchaudio" => packages.push("torchaudio==2.6.0"),
+            _ => {}
+        }
+    }
+
+    if packages.is_empty() {
+        return Ok(());
+    }
+
+    emit_log(app, &format!("Installing missing python packages: {:?}", missing_modules));
+    for attempt in 1..=3 {
+        let mut install_args: Vec<&str> = vec!["-m", "pip", "install"];
+        install_args.extend(packages.iter().copied());
+
+        let output = Command::new(python_exe)
+            .args(install_args)
+            .output()
+            .map_err(|e| format!("Failed to install requirements: {}", e))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let is_lock_error = stderr.contains("WinError 32") || stderr.contains("being used by another process");
+        if is_lock_error && attempt < 3 {
+            emit_log(app, &format!("Dependency install hit file lock (attempt {}/3). Retrying...", attempt));
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+
+        return Err(format!("Failed to install missing python packages: {}", stderr));
+    }
+
+    Err("Failed to install missing python packages after retries".to_string())
+}
+
+#[cfg(target_os = "windows")]
 pub async fn setup_python_environment<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let resources_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
@@ -24,6 +146,7 @@ pub async fn setup_python_environment<R: Runtime>(app: &AppHandle<R>) -> Result<
 
     // 1. Check if Python is already setup
     if python_exe.exists() {
+            ensure_python_dependencies(app, &python_exe, &python_dir)?;
          // Setup WhisperCPP even if Python is ready (to handle upgrades or missing resources)
          if let Err(e) = setup_whisper_cpp(app).await {
               emit_log(app, &format!("Warning: Failed to setup WhisperCPP: {}", e));
@@ -88,76 +211,8 @@ pub async fn setup_python_environment<R: Runtime>(app: &AppHandle<R>) -> Result<
         emit_log(app, "Warning: python311._pth not found, pip might fail.");
     }
 
-    // 4. Install pip
-    // 4. Install pip
-    let get_pip_path = python_dir.join("get-pip.py");
-    emit_log(app, "Locating pip bootstrap...");
-
-    // Find bundled get-pip.py
-    let mut pip_paths = vec![
-        resources_dir.join("get-pip.py"),
-    ];
-    
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            pip_paths.push(exe_dir.join("get-pip.py"));
-            pip_paths.push(exe_dir.join("resources").join("get-pip.py"));
-        }
-    }
-
-    let bundled_pip = pip_paths.into_iter().find(|p| p.exists())
-        .ok_or_else(|| format!("Bundled get-pip.py not found."))?;
-
-    fs::copy(&bundled_pip, &get_pip_path)
-        .map_err(|e| format!("Failed to copy get-pip.py: {}", e))?;
-
-    emit_log(app, "Installing pip...");
-    emit_log(app, "Installing pip...");
-    let output = Command::new(&python_exe)
-        .arg(&get_pip_path)
-        .output()
-        .map_err(|e| format!("Failed to execute get-pip.py: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        println!("[PIP ERROR] Stdout: {}", stdout);
-        println!("[PIP ERROR] Stderr: {}", stderr);
-        return Err(format!("Failed to install pip. Output: {}", stderr));
-    }
-    
-    emit_log(app, "Pip installed successfully.");
-
-    // 5. Install requirements
-    let mut req_paths = vec![
-        resources_dir.join(REQUIREMENTS_FILE_NAME),
-    ];
-    
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            req_paths.push(exe_dir.join(REQUIREMENTS_FILE_NAME));
-            req_paths.push(exe_dir.join("resources").join(REQUIREMENTS_FILE_NAME));
-        }
-    }
-
-    if let Some(req_path) = req_paths.into_iter().find(|p| p.exists()) {
-        emit_log(app, &format!("Installing dependencies from: {:?}", req_path));
-        
-        // We need to handle torch specifically if we want CUDA.
-        // The requirements.txt I wrote has --extra-index-url so it should be fine.
-        
-        let status = Command::new(&python_exe)
-            .args(&["-m", "pip", "install", "-r", &req_path.to_string_lossy()])
-            // Hide window?
-            .status()
-            .map_err(|e| format!("Failed to install requirements: {}", e))?;
-            
-        if !status.success() {
-            return Err("Failed to pip install requirements".to_string());
-        }
-    } else {
-        emit_log(app, "Warning: requirements.txt not found. Skipping dependency installation.");
-    }
+    // 4. Ensure pip and requirements
+    ensure_python_dependencies(app, &python_exe, &python_dir)?;
 
     emit_log(app, "Python environment ready.");
     

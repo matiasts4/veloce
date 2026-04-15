@@ -153,6 +153,15 @@ export function SettingsPage({
   ];
 
   const normalizeModelLabel = (name: string) => name.replace(/^[✓↓]\s*/, "").trim();
+  const humanizeModelValue = (value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return value;
+    const fileName = trimmed.split(/[\\/]/).pop() ?? trimmed;
+    const withoutExt = fileName.replace(/\.(bin|gguf)$/i, "");
+    return withoutExt
+      .replace(/[-_]+/g, " ")
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+  };
 
   const mergedMap = new Map(recommendedModels.map((model) => [model.id, model]));
   for (const model of downloadedModels) {
@@ -343,10 +352,10 @@ export function SettingsPage({
                 className="h-7 w-fit px-2 text-[11px]"
                 onClick={() => {
                   onCaptureShortcutTypeChange("single");
-                  onToggleCaptureComboChange({ key: "Home", ctrlKey: false, shiftKey: false, altKey: false, metaKey: false });
+                  onToggleCaptureComboChange({ key: " ", ctrlKey: false, shiftKey: false, altKey: false, metaKey: false });
                 }}
               >
-                {t("settings.use_home")}
+                Usar Space
               </Button>
             </div>
 
@@ -436,7 +445,7 @@ export function SettingsPage({
                 )) : null}
                 <SelectItem value="__custom_file__">{t("settings.select_file")}</SelectItem>
                 {model && !downloadedOnly.find(m => m.id === model) && model !== "__custom_file__" && (
-                  <SelectItem value={model}>{model}</SelectItem>
+                  <SelectItem value={model}>{humanizeModelValue(model)}</SelectItem>
                 )}
               </SelectContent>
             </Select>

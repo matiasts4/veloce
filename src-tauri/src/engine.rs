@@ -175,6 +175,11 @@ pub async fn spawn_audio_engine<R: Runtime>(
     app_handle: &AppHandle<R>,
     child_arc: Arc<Mutex<Option<CommandChild>>>,
 ) -> Result<(), String> {
+    // Always validate/repair the embedded Python environment before spawning.
+    // This prevents stale partial installs from crashing with missing modules.
+    python_setup::setup_python_environment(app_handle)
+        .await
+        .map_err(|e| format!("Failed to setup Python environment: {}", e))?;
     
     // 0. ALL WE NEED TO DO: Ensure the latest script from the binary is extracted to disk 
     // every time the engine is spawned. If not, Dev builds will run stale code from AppData.

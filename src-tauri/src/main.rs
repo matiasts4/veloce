@@ -175,6 +175,15 @@ fn update_tray_icon(app: AppHandle, recording: bool, volume: Option<f32>) {
         if let Some(tray) = app.tray_by_id("main") {
             let _ = tray.set_icon(Some(icon));
         }
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(window_icon) = Image::from_bytes(&icon_data) {
+                    let _ = window.set_icon(window_icon);
+                }
+            }
+        }
     }
 }
 
