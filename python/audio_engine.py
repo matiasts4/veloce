@@ -1787,11 +1787,12 @@ def start_input_stream(device_id, force_restart=False):
                 chunk = chunk_tensor.T.numpy().astype(np.int16)
 
             # VU Meter emit
-            now = time.time()
-            if now - vu_last_emit >= 1.0 / 15.0:
-                rms = float(np.sqrt(np.mean(chunk.astype(np.float32)**2)))
-                emit({"vu_meter": {"rms": rms}})
-                vu_last_emit = now
+            if recording:
+                now = time.time()
+                if now - vu_last_emit >= 1.0 / 15.0:
+                    rms = float(np.sqrt(np.mean(chunk.astype(np.float32)**2)))
+                    emit({"vu_meter": {"rms": rms}})
+                    vu_last_emit = now
 
             with pre_roll_lock:
                 pre_roll_chunks.append(chunk)

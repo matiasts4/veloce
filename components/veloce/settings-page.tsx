@@ -54,6 +54,10 @@ interface SettingsPageProps {
   onStartWithWindowsChange: (enabled: boolean) => void;
   closeToMiniWidget: boolean;
   onCloseToMiniWidgetChange: (enabled: boolean) => void;
+  showFloatingWidget: boolean;
+  onShowFloatingWidgetChange: (enabled: boolean) => void;
+  showTrayIcon: boolean;
+  onShowTrayIconChange: (enabled: boolean) => void;
   gpuEnabled: boolean;
   onGpuToggle: (enabled: boolean) => void;
   toggleWidgetCombo: HotkeyCombo | null;
@@ -106,6 +110,10 @@ export function SettingsPage({
   onStartWithWindowsChange,
   closeToMiniWidget,
   onCloseToMiniWidgetChange,
+  showFloatingWidget,
+  onShowFloatingWidgetChange,
+  showTrayIcon,
+  onShowTrayIconChange,
   gpuEnabled,
   onGpuToggle,
   toggleWidgetCombo,
@@ -676,6 +684,46 @@ export function SettingsPage({
               id="close-action-toggle"
               checked={closeToMiniWidget}
               onCheckedChange={onCloseToMiniWidgetChange}
+              className="data-[state=checked]:bg-primary"
+            />
+          </div>
+
+          <div className="flex items-center justify-between rounded-lg border border-border bg-secondary/50 px-4 py-3">
+            <div className="flex flex-col gap-0.5">
+              <Label
+                htmlFor="floating-widget-toggle"
+                className="cursor-pointer font-mono text-xs text-foreground"
+              >
+                {t("settings.show_floating_widget", "Mostrar widget flotante")}
+              </Label>
+              <span className="text-xs text-muted-foreground">
+                {t("settings.show_floating_widget_hint", "Si se desactiva, la ventana se ocultará totalmente al minimizar.")}
+              </span>
+            </div>
+            <Switch
+              id="floating-widget-toggle"
+              checked={showFloatingWidget}
+              onCheckedChange={onShowFloatingWidgetChange}
+              className="data-[state=checked]:bg-primary"
+            />
+          </div>
+
+          <div className="flex items-center justify-between rounded-lg border border-border bg-secondary/50 px-4 py-3">
+            <div className="flex flex-col gap-0.5">
+              <Label
+                htmlFor="tray-icon-toggle"
+                className="cursor-pointer font-mono text-xs text-foreground"
+              >
+                {t("settings.show_tray_icon", "Icono en la barra de sistema (Tray)")}
+              </Label>
+              <span className="text-xs text-muted-foreground">
+                {t("settings.show_tray_icon_hint", "Muestra el icono de Veloce en la parte superior del sistema.")}
+              </span>
+            </div>
+            <Switch
+              id="tray-icon-toggle"
+              checked={showTrayIcon}
+              onCheckedChange={onShowTrayIconChange}
               className="data-[state=checked]:bg-primary"
             />
           </div>

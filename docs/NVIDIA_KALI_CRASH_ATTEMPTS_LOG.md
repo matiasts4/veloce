@@ -172,3 +172,37 @@ sudo sed -i 's/^nvidia-drm$/nvidia-current-drm/' /etc/modules-load.d/nvidia.conf
   - Plan de recuperación NVIDIA/CUDA sin snapshot
   - Estrategia rollback snapshot + congelar stack GPU
   - Fix de freeze de boot por initramfs/Wayland
+
+## 9) Solución Final (04 de abril de 2026)
+
+**Problema:**
+El equipo presentaba "freezes" (congelamientos totales) aleatorios, kernel panics en transiciones de energía (`rm_acpi_notify [nvidia]`), soft lockups reportados por watchdog, y módulos no cargables. Todo esto a menudo desencadenado al momento del boot o luego de usar Veloce bajo carga y hacer operaciones con la GPU de NVIDIA (RTX 4050 Laptop).
+
+**Causa Raíz:**
+El driver propietario de NVIDIA (550.x) entraba en conflicto nativo severo con la gestión de energía S0ix de Kali Linux/Wayland, lo cual causaba colisiones en los manejadores ACPI del kernel. Aunado a esto, las configuraciones en `/etc/modules-load.d/` y `/etc/initramfs-tools/modules` apuntaban a nombres equivocados tras actualizaciones de los headers DKMS, lo que entorpecía el arranque o simplemente colgaba Wayland.
+
+**Acciones Resolutivas Aplicadas:**
+1. **Limpieza profunda de configuraciones erróneas/huérfanas:**
+   - Se vaciaron y eliminaron configuraciones en desuso como `nvidia-acpi-fix.conf`, `nvidia-power.conf`, `nvidia.conf`, y parámetros inútiles como `nvidia-drm.modeset=1` que sobraban en GRUB.
+   - Se removió cualquier línea genérica `nvidia` del `/etc/initramfs-tools/modules`.
+
+2. **Detección de los verdaderos módulos del repositorio DKMS (`nvidia-current-open-*.ko.xz`):**
+   - Se observó que las fuentes listaban `nvidia-current-open`, `nvidia-current-open-drm`, `nvidia-current-open-modeset`, y `nvidia-current-open-uvm`.
+   - Se configuró `/etc/modules-load.d/nvidia.conf` y `/etc/initramfs-tools/modules` usando **exactamente** esos identificadores para asegurar la carga.
+
+3. **Desactivación de S0ix (La directiva clave antihang):**
+   - Habilitar los servicios de suspensión ACPI sin problemas:
+     ```
+     options nvidia NVreg_EnableS0ixPowerManagement=0 NVreg_PreserveVideoMemoryAllocations=1 NVreg_DynamicPowerManagement=0x00
+     options nvidia-drm modeset=1
+     ```
+
+4. **Regeneración final del entorno de arranque:**
+   - `sudo update-initramfs -u`
+   - `sudo update-grub`
+
+5. **Activación del entorno virtual de Python (`Veloce`) para evaluar PyTorch:**
+   - Después de los ajustes y habilitar bien los módulos `uvm`, PyTorch reconoció exitosamente la placa a través del virtual enviroment (`.venv/bin/activate`).
+   - `nvidia-smi` ahora exhibe estabilidad marcando ~25W de consumo tope como P-State design (debido a perfil limitador Max-Q Mobile nativo del firmware).
+
+**Estado:** Solucionado y estabilizado al 100%. Veloce en modo Desktop (Tauri) con soporte en backend (Fast-Whisper CUDA) no ocasiona lockups. El 80% de batería es una configuración esperada y benigna del firmware Dell.

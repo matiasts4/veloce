@@ -120,6 +120,8 @@ export default function VelocePage() {
 
   // Settings state
   const [microphone, setMicrophone] = useState("default");
+  // Tracks the user's desired mic (persisted preference) so hardware-info events can reconcile
+  const desiredMicrophoneRef = useRef("default");
   const [model, setModel] = useState("large-v3-turbo");
   const [modelDir, setModelDir] = useState("");
   const [defaultModelDir, setDefaultModelDir] = useState("");
@@ -133,6 +135,9 @@ export default function VelocePage() {
   const [expandedViewSize, setExpandedViewSize] = useState<ExpandedViewSize>("large");
   const [startWithWindows, setStartWithWindows] = useState(false);
   const [closeToMiniWidget, setCloseToMiniWidget] = useState(true);
+  const [showFloatingWidget, setShowFloatingWidget] = useState(true);
+  const [showTrayIcon, setShowTrayIcon] = useState(true);
+  const lastTrayLevelRef = useRef(0);
   const [gpuEnabled, setGpuEnabled] = useState(false);
   const [availableMics, setAvailableMics] = useState<{ id: number | string; name: string }[]>([]);
   const [downloadedModels, setDownloadedModels] = useState<{ id: string; name: string; downloaded?: boolean }[]>([]);
@@ -167,6 +172,60 @@ export default function VelocePage() {
     clipboardModeRef.current = clipboardMode;
     clipboardAutoPasteRef.current = clipboardAutoPaste;
   }, [clipboardMode, clipboardAutoPaste]);
+
+  // Update tray icon based on recording state — reset when recording stops
+  useEffect(() => {
+    if (!showTrayIcon) return;
+    const isRecording = status === "listening" || status === "transcribing";
+    if (!isRecording) {
+      lastTrayLevelRef.current = -1; // force reset so next recording start re-draws level 0
+      import("@/lib/tauri-client").then(({ safeInvoke }) => {
+        safeInvoke("update_tray_icon", { recording: false }).catch(console.error);
+      });
+    }
+  }, [status, showTrayIcon]);
+
+  // Handle dynamic tray icon updates from VU meter (stable listener — no re-register on level change)
+  useEffect(() => {
+    if (!showTrayIcon || (status !== "listening" && status !== "transcribing")) return;
+
+    let unlisten: () => void;
+    import("@tauri-apps/api/event").then(({ listen }) => {
+      listen<any>("vu-update", (event) => {
+        const rms = event.payload.rms;
+
+        // Same log scale as mini-vu-bars.tsx
+        let normalized = Math.log10(rms + 1) / 4.2;
+        normalized = (normalized - 0.3) / 0.7;
+        normalized = Math.max(0, Math.min(1, normalized));
+
+        // 5 levels: 0 = minimal bars, 4 = full bars
+        let level = 0;
+        if (normalized > 0.75) level = 4;
+        else if (normalized > 0.5) level = 3;
+        else if (normalized > 0.25) level = 2;
+        else if (normalized > 0.05) level = 1;
+
+        // Only update icon when level actually changes (avoids IPC spam)
+        if (level !== lastTrayLevelRef.current) {
+          lastTrayLevelRef.current = level;
+          const volumes = [0, 100, 500, 1000, 2000];
+          import("@/lib/tauri-client").then(({ safeInvoke }) => {
+            safeInvoke("update_tray_icon", { recording: true, volume: volumes[level] }).catch(console.error);
+          });
+        }
+      }).then(u => { unlisten = u; });
+    });
+
+    return () => { if (unlisten) unlisten(); };
+  }, [showTrayIcon, status]);
+
+  // Sync Tray Icon presence with backend
+  useEffect(() => {
+    import("@/lib/tauri-client").then(({ safeInvoke }) => {
+      safeInvoke("set_tray_visible", { visible: showTrayIcon }).catch(console.error);
+    });
+  }, [showTrayIcon]);
 
   // Sync language with i18n
   useEffect(() => {
@@ -246,7 +305,7 @@ export default function VelocePage() {
   const handleToggleVisibility = useCallback(() => {
     if (isVisible) {
       setIsVisible(false);
-      setShowMiniWidget(true);
+      setShowMiniWidget(showFloatingWidget);
 
       import("@/lib/tauri-client").then(({ isTauri }) => {
         if (!isTauri()) return;
@@ -254,12 +313,19 @@ export default function VelocePage() {
         Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
           .then(async ([windowApi, dpiApi]) => {
             const { getCurrentWindow } = windowApi;
-            const { LogicalSize } = dpiApi;
             const window = getCurrentWindow();
-            await window.setAlwaysOnTop(true);
-            setTimeout(async () => {
-              await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
-            }, 50);
+            if (!showFloatingWidget) {
+              await window.setSkipTaskbar(true);
+              setTimeout(async () => {
+                await window.hide();
+              }, 50);
+            } else {
+              const { LogicalSize } = dpiApi;
+              await window.setAlwaysOnTop(true);
+              setTimeout(async () => {
+                await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
+              }, 50);
+            }
           })
           .catch((error) => console.error("Failed to minimize from hotkey", error));
       });
@@ -278,16 +344,20 @@ export default function VelocePage() {
           const { LogicalSize } = dpiApi;
           const window = getCurrentWindow();
           const target = getExpandedWindowSize();
+          await window.setSkipTaskbar(false);
+          await window.show();
           await window.setAlwaysOnTop(true);
           await window.setSize(new LogicalSize(target.width, target.height));
+          await window.unminimize();
+          await window.setFocus();
         })
         .catch((error) => console.error("Failed to restore from hotkey", error));
     });
-  }, [getExpandedWindowSize, isVisible]);
+  }, [getExpandedWindowSize, isVisible, showFloatingWidget]);
 
   const handleMinimizeToMiniWidget = useCallback(() => {
     setIsVisible(false);
-    setShowMiniWidget(true);
+    setShowMiniWidget(showFloatingWidget);
 
     import("@/lib/tauri-client").then(({ isTauri }) => {
       if (!isTauri()) return;
@@ -295,18 +365,25 @@ export default function VelocePage() {
       Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/dpi")])
         .then(async ([windowApi, dpiApi]) => {
           const { getCurrentWindow } = windowApi;
-          const { LogicalSize } = dpiApi;
           const window = getCurrentWindow();
-          await window.setResizable(false);
-          await window.setMaximizable(false);
-          await window.setAlwaysOnTop(true);
-          setTimeout(async () => {
-            await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
-          }, 50);
+          if (!showFloatingWidget) {
+            await window.setSkipTaskbar(true);
+            setTimeout(async () => {
+              await window.hide();
+            }, 50);
+          } else {
+            const { LogicalSize } = dpiApi;
+            await window.setResizable(false);
+            await window.setMaximizable(false);
+            await window.setAlwaysOnTop(true);
+            setTimeout(async () => {
+              await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
+            }, 50);
+          }
         })
         .catch((error) => console.error("Failed to minimize to mini widget", error));
     });
-  }, []);
+  }, [showFloatingWidget]);
 
   const handleRestoreFromMiniWidget = useCallback(() => {
     setIsVisible(true);
@@ -321,6 +398,8 @@ export default function VelocePage() {
           const { LogicalSize } = dpiApi;
           const window = getCurrentWindow();
           const target = getExpandedWindowSize();
+          await window.setSkipTaskbar(false);
+          await window.show();
           await window.setAlwaysOnTop(true);
           await window.setResizable(true);
           await window.setMaximizable(true);
@@ -450,12 +529,18 @@ export default function VelocePage() {
     let unlistenLog: () => void;
     let unlistenModelDownload: () => void;
     let unlistenUnminimize: () => void;
+    let unlistenShowWindow: () => void;
 
     import("@/lib/tauri-client").then(({ isTauri }) => {
       if (!isTauri()) return;
 
       import("@tauri-apps/api/event").then(async ({ listen }) => {
         unlistenUnminimize = await listen("tauri://unminimize", () => {
+          handleRestoreFromMiniWidget();
+        });
+
+        // Fired when the tray "Mostrar Veloce" is clicked while the window is hidden
+        unlistenShowWindow = await listen("show-window", () => {
           handleRestoreFromMiniWidget();
         });
 
@@ -540,9 +625,25 @@ export default function VelocePage() {
             : false;
 
           if (Array.isArray(event.payload.microphones)) {
-            setAvailableMics(event.payload.microphones);
+            const mics: { id: number | string; name: string }[] = event.payload.microphones;
+            setAvailableMics(mics);
+
+            // Reconcile selection: try to restore the desired mic, fall back to default
+            setMicrophone((current) => {
+              const desired = desiredMicrophoneRef.current;
+              const ids = mics.map((m) => m.id.toString());
+
+              if (desired !== "default" && ids.includes(desired)) {
+                return desired;
+              }
+              if (current !== "default" && ids.includes(current)) {
+                return current;
+              }
+              return "default";
+            });
+
             // Mark hardware as valid if we have microphones
-            if (event.payload.microphones.length > 0) {
+            if (mics.length > 0) {
               hasValidHardwareRef.current = true;
               hasValidHardwareRef.current = true;
               if (bootMinTimePassedRef.current && isBackendReady) {
@@ -765,15 +866,22 @@ export default function VelocePage() {
       if (unlistenLog) unlistenLog();
       if (unlistenModelDownload) unlistenModelDownload();
       if (unlistenUnminimize) unlistenUnminimize();
+      if (unlistenShowWindow) unlistenShowWindow();
     };
   }, []);
 
+  // Load settings - ONLY ONCE on mount
   useEffect(() => {
     try {
       const raw = localStorage.getItem(SETTINGS_KEY);
       if (raw) {
         const saved = JSON.parse(raw);
-        if (typeof saved.microphone === "string") setMicrophone(saved.microphone);
+        console.log("Loading saved settings:", saved);
+        
+        if (typeof saved.microphone === "string") {
+          setMicrophone(saved.microphone);
+          desiredMicrophoneRef.current = saved.microphone;
+        }
         if (typeof saved.model === "string") setModel(saved.model);
         if (typeof saved.modelDir === "string") setModelDir(saved.modelDir);
         if (saved.backend === "auto" || saved.backend === "faster-whisper" || saved.backend === "whispercpp") {
@@ -784,22 +892,20 @@ export default function VelocePage() {
         }
         if (saved.captureShortcutType === "single" || saved.captureShortcutType === "combo") {
           setCaptureShortcutType(saved.captureShortcutType);
-        } else {
-          const loadedCaptureCombo =
-            saved.toggleCaptureCombo && typeof saved.toggleCaptureCombo === "object"
-              ? (saved.toggleCaptureCombo as HotkeyCombo)
-              : DEFAULT_TOGGLE_CAPTURE;
-          setCaptureShortcutType(inferShortcutType(loadedCaptureCombo));
+        } else if (saved.toggleCaptureCombo) {
+          setCaptureShortcutType(inferShortcutType(saved.toggleCaptureCombo as HotkeyCombo));
         }
         if (typeof saved.language === "string") setLanguage(saved.language);
         if (saved.uiLanguage === "es" || saved.uiLanguage === "en") setUiLanguage(saved.uiLanguage);
-        if (saved.expandedViewSize === "compact" || saved.expandedViewSize === "large") setExpandedViewSize(saved.expandedViewSize);
+        if (typeof saved.expandedViewSize === "string") setExpandedViewSize(saved.expandedViewSize as ExpandedViewSize);
         if (typeof saved.startWithWindows === "boolean") setStartWithWindows(saved.startWithWindows);
+        if (typeof saved.closeToMiniWidget === "boolean") setCloseToMiniWidget(saved.closeToMiniWidget);
+        if (typeof saved.showFloatingWidget === "boolean") setShowFloatingWidget(saved.showFloatingWidget);
+        if (typeof saved.showTrayIcon === "boolean") setShowTrayIcon(saved.showTrayIcon);
         if (typeof saved.gpuEnabled === "boolean") setGpuEnabled(saved.gpuEnabled);
         if (typeof saved.clipboardMode === "boolean") setClipboardMode(saved.clipboardMode);
         if (typeof saved.clipboardAutoPaste === "boolean") setClipboardAutoPaste(saved.clipboardAutoPaste);
         if (typeof saved.showResponseTimes === "boolean") setShowResponseTimes(saved.showResponseTimes);
-        if (typeof saved.closeToMiniWidget === "boolean") setCloseToMiniWidget(saved.closeToMiniWidget);
         if (saved.toggleWidgetCombo === null || typeof saved.toggleWidgetCombo === "object") setToggleWidgetCombo(saved.toggleWidgetCombo ?? null);
         if (saved.toggleCaptureCombo === null || typeof saved.toggleCaptureCombo === "object") setToggleCaptureCombo(saved.toggleCaptureCombo ?? null);
       }
@@ -831,6 +937,8 @@ export default function VelocePage() {
         clipboardAutoPaste,
         showResponseTimes,
         closeToMiniWidget,
+        showFloatingWidget,
+        showTrayIcon,
         toggleWidgetCombo,
         toggleCaptureCombo,
       })
@@ -852,6 +960,8 @@ export default function VelocePage() {
     clipboardAutoPaste,
     showResponseTimes,
     closeToMiniWidget,
+    showFloatingWidget,
+    showTrayIcon,
     toggleWidgetCombo,
     toggleCaptureCombo,
   ]);
@@ -1088,6 +1198,8 @@ export default function VelocePage() {
           clipboardAutoPaste,
           showResponseTimes,
           closeToMiniWidget,
+          showFloatingWidget,
+          showTrayIcon,
           toggleWidgetCombo,
           toggleCaptureCombo,
         })
@@ -1113,6 +1225,8 @@ export default function VelocePage() {
     clipboardAutoPaste,
     showResponseTimes,
     closeToMiniWidget,
+    showFloatingWidget,
+    showTrayIcon,
     toggleWidgetCombo,
     toggleCaptureCombo,
   ]);
@@ -1215,7 +1329,10 @@ export default function VelocePage() {
                 <SettingsPage
                   onBack={() => setView("recorder")}
                   microphone={microphone}
-                  onMicrophoneChange={setMicrophone}
+                  onMicrophoneChange={(value) => {
+                    desiredMicrophoneRef.current = value;
+                    setMicrophone(value);
+                  }}
                   model={model}
                   onModelChange={setModel}
                   modelDir={modelDir}
@@ -1238,6 +1355,10 @@ export default function VelocePage() {
                   onStartWithWindowsChange={setStartWithWindows}
                   closeToMiniWidget={closeToMiniWidget}
                   onCloseToMiniWidgetChange={setCloseToMiniWidget}
+                  showFloatingWidget={showFloatingWidget}
+                  onShowFloatingWidgetChange={setShowFloatingWidget}
+                  showTrayIcon={showTrayIcon}
+                  onShowTrayIconChange={setShowTrayIcon}
                   gpuEnabled={gpuEnabled}
                   onGpuToggle={setGpuEnabled}
                   toggleWidgetCombo={toggleWidgetCombo}
@@ -1327,41 +1448,56 @@ export default function VelocePage() {
         ) : showMiniWidget ? (
           <motion.div
             key="mini-widget"
-            initial={{ opacity: 0, scale: 0.8 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.8 }}
-            className="absolute left-0 top-0 z-50 flex h-full w-full items-center justify-center p-3"
+            initial={{ opacity: 0, y: -8, scale: 0.92 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -8, scale: 0.92 }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+            className="absolute left-0 top-0 z-50 flex h-full w-full items-center justify-center"
           >
             <div
-              className={`group relative flex h-11 w-fit min-w-[170px] cursor-grab items-center rounded-full border border-border/80 bg-card px-5 shadow-xl transition-all duration-500 active:cursor-grabbing overflow-hidden ${
-                status === "listening" 
-                  ? "border-primary/40 shadow-[0_0_15px_rgba(37,99,235,0.15)] ring-1 ring-primary/20" 
+              className={`group relative flex items-center gap-2.5 cursor-grab rounded-full border px-4 py-2 shadow-2xl backdrop-blur-md transition-all duration-300 active:cursor-grabbing select-none ${
+                status === "listening"
+                  ? "border-primary/50 bg-primary/10 shadow-[0_4px_24px_rgba(37,99,235,0.25)] ring-1 ring-primary/20"
                   : status === "transcribing"
-                  ? "border-cyan-400/40 shadow-[0_0_15px_rgba(34,211,238,0.15)] ring-1 ring-cyan-400/20"
+                  ? "border-cyan-400/50 bg-cyan-400/10 shadow-[0_4px_24px_rgba(34,211,238,0.2)] ring-1 ring-cyan-400/20"
                   : status === "processing"
-                  ? "border-amber-500/40 shadow-[0_0_15px_rgba(245,158,11,0.15)] ring-1 ring-amber-500/20"
-                  : "hover:border-border"
+                  ? "border-amber-500/50 bg-amber-500/10 shadow-[0_4px_24px_rgba(245,158,11,0.2)] ring-1 ring-amber-500/20"
+                  : "border-border/60 bg-card/80 shadow-[0_4px_20px_rgba(0,0,0,0.3)]"
               }`}
               data-tauri-drag-region
+              onDoubleClick={handleRestoreFromMiniWidget}
             >
-              {/* Main Content Area */}
-              <div
-                data-tauri-drag-region
-                className="flex items-center gap-3.5 py-1 z-10 w-full"
-                onDoubleClick={handleRestoreFromMiniWidget}
-              >
+              {/* Drag region overlay */}
+              <div className="absolute inset-0 rounded-full" data-tauri-drag-region />
+
+              {/* VU bars */}
+              <div className="relative z-10 pointer-events-none">
                 <MiniVUBars status={status} />
-                <span className={`pointer-events-none font-mono text-[10px] font-medium uppercase tracking-widest transition-colors duration-500 ${
-                  status === "listening" ? "text-primary/90" : 
-                  status === "transcribing" ? "text-cyan-400/90" : 
-                  status === "processing" ? "text-amber-500/90" : 
-                  "text-muted-foreground"
-                }`}>
-                  {showMiniDoneTick ? t("mini.ready") : t("mini.recorder")}
-                </span>
               </div>
 
-              {/* Close Button in the literal corner */}
+              {/* Status label */}
+              <span
+                className={`relative z-10 pointer-events-none font-mono text-[9px] font-semibold uppercase tracking-[0.15em] transition-colors duration-300 ${
+                  status === "listening" ? "text-primary" :
+                  status === "transcribing" ? "text-cyan-400" :
+                  status === "processing" ? "text-amber-500" :
+                  "text-muted-foreground/70"
+                }`}
+              >
+                {status === "listening" ? t("mini.recorder") :
+                 status === "transcribing" ? t("mini.ready") :
+                 status === "processing" ? "loading..." :
+                 showMiniDoneTick ? t("mini.ready") : t("mini.recorder")}
+              </span>
+
+              {/* Subtle animated ring when active */}
+              {(status === "listening" || status === "transcribing") && (
+                <span className={`absolute inset-0 rounded-full animate-ping opacity-20 ${
+                  status === "listening" ? "bg-primary" : "bg-cyan-400"
+                }`} style={{ animationDuration: "2s" }} />
+              )}
+
+              {/* Close button */}
               <button
                 onClick={async (e) => {
                   e.stopPropagation();
@@ -1372,16 +1508,14 @@ export default function VelocePage() {
                     console.error("Failed to close app", error);
                   }
                 }}
-                className="absolute right-0 top-0 z-20 flex h-5 w-5 scale-0 items-center justify-center rounded-full bg-muted/20 text-muted-foreground opacity-0 shadow-sm transition-all duration-300 group-hover:scale-100 group-hover:opacity-100 hover:bg-destructive hover:text-white"
+                className="relative z-20 ml-0.5 flex h-4 w-4 scale-0 items-center justify-center rounded-full bg-muted/30 text-muted-foreground opacity-0 transition-all duration-200 group-hover:scale-100 group-hover:opacity-100 hover:bg-destructive/80 hover:text-white"
                 aria-label={t("mini.close_mini_widget")}
               >
-                <X className="h-3 w-3 stroke-[2.5]" />
+                <X className="h-2.5 w-2.5 stroke-[2.5]" />
               </button>
             </div>
           </motion.div>
-        ) : (
-          <motion.div key="hidden-empty" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} />
-        )}
+        ) : null}
       </AnimatePresence>
     </main >
   );

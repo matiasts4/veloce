@@ -12,6 +12,7 @@
     "app": {
         "windows": [
             {
+                "label": "main",
                 "title": "Veloce",
                 "width": 420,
                 "height": 520,
@@ -34,15 +35,15 @@
     "bundle": {
         "active": true,
         "targets": [
-            "nsis",
-            "deb",
-            "appimage"
+            "deb"
         ],
         "linux": {
             "deb": {
                 "depends": [
                     "python3-venv",
-                    "libportaudio2"
+                    "libportaudio2",
+                    "libayatana-appindicator3-1",
+                    "libappindicator3-1"
                 ]
             }
         },

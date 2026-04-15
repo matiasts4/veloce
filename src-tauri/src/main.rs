@@ -2,6 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use tauri::{AppHandle, Manager, Emitter, Runtime, WindowEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::menu::{Menu, MenuItem};
+use tauri::image::Image;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 use std::sync::{Arc, Mutex};
 
@@ -56,6 +59,10 @@ fn main() {
                     backend: "auto".to_string(),
                 })),
             });
+
+            // Create the tray icon on startup using our bars icon (not the W square logo)
+            // This ensures only ONE tray icon ever exists — frontend controls visibility via set_tray_visible
+            let _ = create_tray(app_handle);
 
             let app_handle_clone = app_handle.clone();
             let child_arc_clone = child_arc.clone();
@@ -137,11 +144,106 @@ fn main() {
             delete_model,
             get_startup_enabled,
             set_startup_enabled,
-            install_audio_engine
+            install_audio_engine,
+            update_tray_icon,
+            set_tray_visible
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[tauri::command]
+fn update_tray_icon(app: AppHandle, recording: bool, volume: Option<f32>) {
+    let icon_data = if recording {
+        let vol = volume.unwrap_or(0.0);
+        if vol > 2000.0 {
+            include_bytes!("../icons/32x32-recording-v4.png").to_vec()
+        } else if vol > 1000.0 {
+            include_bytes!("../icons/32x32-recording-v3.png").to_vec()
+        } else if vol > 500.0 {
+            include_bytes!("../icons/32x32-recording-v2.png").to_vec()
+        } else if vol > 100.0 {
+            include_bytes!("../icons/32x32-recording-v1.png").to_vec()
+        } else {
+            include_bytes!("../icons/32x32-recording.png").to_vec()
+        }
+    } else {
+        // Use the bars-idle icon (NOT the W square app logo) to keep visual consistency
+        include_bytes!("../icons/32x32.png").to_vec()
+    };
+    if let Ok(icon) = Image::from_bytes(&icon_data) {
+        if let Some(tray) = app.tray_by_id("main") {
+            let _ = tray.set_icon(Some(icon));
+        }
+    }
+}
+
+#[tauri::command]
+fn set_tray_visible(app: AppHandle, visible: bool) {
+    if visible {
+        if app.tray_by_id("main").is_none() {
+            let _ = create_tray(&app);
+        }
+    } else {
+        let _ = app.remove_tray_by_id("main");
+    }
+}
+
+fn create_tray(app: &AppHandle) -> Result<(), tauri::Error> {
+    let show = MenuItem::with_id(app, "show", "Mostrar Veloce", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Salir", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    // Use our custom bars icon as the tray icon — never use the square W logo
+    let bars_idle = include_bytes!("../icons/32x32.png");
+    let icon = Image::from_bytes(bars_idle)
+        .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
+
+    TrayIconBuilder::with_id("main")
+        .icon(icon)
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+            match event.id.as_ref() {
+                "show" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.unminimize();
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        let _ = app.emit("show-window", ());
+                    }
+                }
+                "quit" => {
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
+        })
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } => {
+                let app = tray.app_handle();
+                if let Some(window) = app.get_webview_window("main") {
+                    let is_visible = window.is_visible().unwrap_or(false);
+                    if is_visible {
+                        let _ = window.hide();
+                    } else {
+                        let _ = window.unminimize();
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        let _ = app.emit("show-window", ());
+                    }
+                }
+            }
+            _ => {}
+        })
+        .build(app)?;
+    Ok(())
+}
+
 
 #[tauri::command]
 async fn install_audio_engine(app: AppHandle) -> Result<(), String> {
