@@ -79,6 +79,8 @@ interface SettingsPageProps {
   onClipboardModeChange: (enabled: boolean) => void;
   clipboardAutoPaste: boolean;
   onClipboardAutoPasteChange: (enabled: boolean) => void;
+  autoPasteMode: "ctrl_v" | "ctrl_shift_v" | "type_text";
+  onAutoPasteModeChange: (mode: "ctrl_v" | "ctrl_shift_v" | "type_text") => void;
   onRefreshHardware: () => void;
   onSave: () => void;
   className?: string;
@@ -134,6 +136,8 @@ export function SettingsPage({
   onClipboardModeChange,
   clipboardAutoPaste,
   onClipboardAutoPasteChange,
+  autoPasteMode,
+  onAutoPasteModeChange,
   onRefreshHardware,
   onSave,
   className,
@@ -799,6 +803,25 @@ export function SettingsPage({
               disabled={!clipboardMode}
               className="data-[state=checked]:bg-primary"
             />
+          </div>
+
+          <div className="flex flex-col gap-2 rounded-lg border border-border bg-secondary/50 px-4 py-3">
+            <Label htmlFor="auto-paste-mode-select" className="font-mono text-xs text-foreground">
+              {t("settings.auto_paste_mode")}
+            </Label>
+            <Select value={autoPasteMode} onValueChange={(value) => onAutoPasteModeChange(value as "ctrl_v" | "ctrl_shift_v" | "type_text")}>
+              <SelectTrigger id="auto-paste-mode-select" className="border-border bg-secondary text-foreground" disabled={!clipboardMode || !clipboardAutoPaste}>
+                <SelectValue placeholder={t("settings.auto_paste_mode")} />
+              </SelectTrigger>
+              <SelectContent className="border-border bg-card text-foreground">
+                <SelectItem value="ctrl_v">{t("settings.auto_paste_mode_ctrl_v")}</SelectItem>
+                <SelectItem value="ctrl_shift_v">{t("settings.auto_paste_mode_ctrl_shift_v")}</SelectItem>
+                <SelectItem value="type_text">{t("settings.auto_paste_mode_type_text")}</SelectItem>
+              </SelectContent>
+            </Select>
+            <span className="text-xs text-muted-foreground">
+              {t("settings.auto_paste_mode_hint")}
+            </span>
           </div>
 
           <div className="flex items-center justify-between rounded-lg border border-border bg-secondary/50 px-4 py-3">

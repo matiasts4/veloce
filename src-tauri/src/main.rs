@@ -15,7 +15,7 @@ mod startup;
 mod downloader;
 mod python_setup;
 
-use state::{AppState, EngineSettings};
+use state::{AppState, AutoPasteMode, EngineSettings};
 use shortcuts::HotkeyConfig;
 
 fn main() {
@@ -31,9 +31,12 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(shortcuts::handle_shortcut).build())
         .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { .. } = event {
-                let state = window.state::<AppState>();
-                engine::stop_audio_engine(&state);
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // Prevent the window from actually closing — just hide it.
+                // The app stays alive in the system tray with the engine running.
+                // The user must click "Salir" in the tray to fully exit.
+                api.prevent_close();
+                let _ = window.hide();
             }
         })
         .setup(|app| {
@@ -42,6 +45,7 @@ fn main() {
             let child_arc = Arc::new(Mutex::new(None));
             let clipboard_mode = Arc::new(Mutex::new(false));
             let clipboard_auto_paste = Arc::new(Mutex::new(false));
+            let auto_paste_mode = Arc::new(Mutex::new(AutoPasteMode::default_for_current_os()));
             
             app.manage(AppState {
                 sidecar_child: child_arc.clone(),
@@ -50,6 +54,7 @@ fn main() {
                 capture_shortcut: Arc::new(Mutex::new(None)),
                 clipboard_mode: clipboard_mode.clone(),
                 clipboard_auto_paste: clipboard_auto_paste.clone(),
+                auto_paste_mode: auto_paste_mode.clone(),
                 engine_settings: Arc::new(Mutex::new(EngineSettings {
                     microphone: "default".to_string(),
                     model: "large-v3-turbo".to_string(),
@@ -223,7 +228,11 @@ fn create_tray(app: &AppHandle) -> Result<(), tauri::Error> {
                     }
                 }
                 "quit" => {
-                    std::process::exit(0);
+                    // Stop the audio engine (sends EXIT + waits + kills process tree)
+                    // before exiting so the Python process is not left as an orphan.
+                    let state = app.state::<AppState>();
+                    engine::stop_audio_engine(&state);
+                    app.exit(0);
                 }
                 _ => {}
             }
@@ -260,12 +269,24 @@ async fn install_audio_engine(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_clipboard_settings(state: tauri::State<AppState>, enabled: bool, auto_paste: bool) {
+#[allow(non_snake_case)]
+fn set_clipboard_settings(
+    state: tauri::State<AppState>,
+    enabled: bool,
+    autoPaste: bool,
+    autoPasteMode: Option<String>,
+) {
     let mut clipboard = state.clipboard_mode.lock().unwrap();
     *clipboard = enabled;
 
     let mut clipboard_auto_paste = state.clipboard_auto_paste.lock().unwrap();
-    *clipboard_auto_paste = auto_paste;
+    *clipboard_auto_paste = autoPaste;
+
+    let mut mode = state.auto_paste_mode.lock().unwrap();
+    *mode = autoPasteMode
+        .as_deref()
+        .map(AutoPasteMode::from_value)
+        .unwrap_or_else(AutoPasteMode::default_for_current_os);
 }
 
 #[tauri::command]
@@ -289,17 +310,41 @@ fn type_text(text: String) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn press_paste_shortcut() -> Result<(), String> {
+fn press_paste_shortcut_for_mode(mode: AutoPasteMode) -> Result<(), String> {
     use enigo::{Direction, Enigo, Key, Keyboard, Settings};
     let mut enigo = match Enigo::new(&Settings::default()) {
         Ok(instance) => instance,
         Err(_) => return Err("Failed to init enigo".to_string()),
     };
+
+    if mode == AutoPasteMode::TypeText {
+        return Ok(());
+    }
+
     let _ = enigo.key(Key::Control, Direction::Press);
+
+    if mode == AutoPasteMode::CtrlShiftV {
+        let _ = enigo.key(Key::Shift, Direction::Press);
+    }
+
     let _ = enigo.key(Key::Unicode('v'), Direction::Click);
+
+    if mode == AutoPasteMode::CtrlShiftV {
+        let _ = enigo.key(Key::Shift, Direction::Release);
+    }
+
     let _ = enigo.key(Key::Control, Direction::Release);
     Ok(())
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+fn press_paste_shortcut(state: tauri::State<AppState>, autoPasteMode: Option<String>) -> Result<(), String> {
+    let mode = autoPasteMode
+        .as_deref()
+        .map(AutoPasteMode::from_value)
+        .unwrap_or_else(|| *state.auto_paste_mode.lock().unwrap());
+    press_paste_shortcut_for_mode(mode)
 }
 
 #[tauri::command]
@@ -462,4 +507,27 @@ async fn delete_model(app: AppHandle, state: tauri::State<'_, AppState>, model: 
         let _ = app.emit("engine-log", format!("Solicitando eliminación de modelo: {model}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::press_paste_shortcut_for_mode;
+    use crate::state::AutoPasteMode;
+
+    #[test]
+    fn parses_known_auto_paste_modes() {
+        assert_eq!(AutoPasteMode::from_value("ctrl_v"), AutoPasteMode::CtrlV);
+        assert_eq!(AutoPasteMode::from_value("ctrl_shift_v"), AutoPasteMode::CtrlShiftV);
+        assert_eq!(AutoPasteMode::from_value("type_text"), AutoPasteMode::TypeText);
+    }
+
+    #[test]
+    fn defaults_to_ctrl_v_when_mode_is_unknown() {
+        assert_eq!(AutoPasteMode::from_value("something-else"), AutoPasteMode::CtrlV);
+    }
+
+    #[test]
+    fn type_text_mode_skips_shortcut_emulation() {
+        assert!(press_paste_shortcut_for_mode(AutoPasteMode::TypeText).is_ok());
+    }
 }

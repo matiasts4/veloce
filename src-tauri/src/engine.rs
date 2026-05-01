@@ -341,16 +341,33 @@ pub async fn spawn_audio_engine<R: Runtime>(
 
 
 pub fn stop_audio_engine(state: &tauri::State<AppState>) {
-    // Attempt graceful shutdown first
+    // Attempt graceful shutdown first via EXIT command
     let _ = write_engine_command(state, "EXIT\n");
-    // Give the engine a little time to gracefully tear down the whisper server
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    
+    // Give the engine time to gracefully tear down
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
     if let Ok(mut lock) = state.sidecar_child.lock() {
         if let Some(child) = lock.take() {
+            let pid = child.pid();
             let _ = child.kill();
+            // On Linux: also kill descendant processes (e.g. whisper-cli subprocess,
+            // multiprocessing workers) so nothing is left orphaned.
+            #[cfg(target_os = "linux")]
+            kill_process_tree(pid);
         }
     }
+}
+
+/// Kills all descendant processes of `pid` on Linux to prevent orphans.
+#[cfg(target_os = "linux")]
+fn kill_process_tree(pid: u32) {
+    // Kill children first, then the parent (belt-and-suspenders with child.kill() above)
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-P", &pid.to_string()])
+        .output();
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output();
 }
 
 pub fn write_engine_command(state: &tauri::State<AppState>, command: &str) -> Result<(), String> {

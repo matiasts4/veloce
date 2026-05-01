@@ -28,6 +28,7 @@ type UiLanguage = "es" | "en";
 type BackendId = "auto" | "faster-whisper" | "whispercpp";
 type CaptureMode = "toggle" | "hold";
 type CaptureShortcutType = "single" | "combo";
+type AutoPasteMode = "ctrl_v" | "ctrl_shift_v" | "type_text";
 type ExpandedViewSize = "compact" | "large";
 type ModelDownloadStatus = "idle" | "starting" | "downloading" | "completed" | "error";
 type ModelDownloadState = {
@@ -41,6 +42,9 @@ type View = "recorder" | "library" | "models" | "settings";
 
 const SETTINGS_KEY = "veloce:settings:v1";
 const ONBOARDING_DONE_KEY = "veloce:onboarding:done:v1";
+const DEFAULT_AUTO_PASTE_MODE: AutoPasteMode = typeof navigator !== "undefined" && /linux/i.test(navigator.userAgent)
+  ? "ctrl_shift_v"
+  : "ctrl_v";
 const NORMAL_WIDTH = 500;
 const NORMAL_HEIGHT = 620;
 const LARGE_WIDTH = 700;
@@ -152,6 +156,7 @@ export default function VelocePage() {
   ]);
   const [clipboardMode, setClipboardMode] = useState(false);
   const [clipboardAutoPaste, setClipboardAutoPaste] = useState(false);
+  const [autoPasteMode, setAutoPasteMode] = useState<AutoPasteMode>(DEFAULT_AUTO_PASTE_MODE);
   const [showResponseTimes, setShowResponseTimes] = useState(true);
   const [latestTranscript, setLatestTranscript] = useState("");
   const [lastResponseMs, setLastResponseMs] = useState<number | null>(null);
@@ -167,11 +172,13 @@ export default function VelocePage() {
   const sessionSavedRef = useRef(false);
   const clipboardModeRef = useRef(clipboardMode);
   const clipboardAutoPasteRef = useRef(clipboardAutoPaste);
+  const autoPasteModeRef = useRef<AutoPasteMode>(autoPasteMode);
 
   useEffect(() => {
     clipboardModeRef.current = clipboardMode;
     clipboardAutoPasteRef.current = clipboardAutoPaste;
-  }, [clipboardMode, clipboardAutoPaste]);
+    autoPasteModeRef.current = autoPasteMode;
+  }, [clipboardMode, clipboardAutoPaste, autoPasteMode]);
 
   // Update tray icon based on recording state — reset when recording stops
   useEffect(() => {
@@ -581,8 +588,14 @@ export default function VelocePage() {
             if (fullText && clipboardModeRef.current) {
               if (clipboardAutoPasteRef.current) {
                 import("@/lib/tauri-client").then(({ safeInvoke }) => {
+                  if (autoPasteModeRef.current === "type_text") {
+                    safeInvoke("type_text", { text: fullText })
+                      .catch(console.error);
+                    return;
+                  }
+
                   safeInvoke("set_clipboard", { text: fullText })
-                    .then(() => safeInvoke("press_paste_shortcut"))
+                    .then(() => safeInvoke("press_paste_shortcut", { autoPasteMode: autoPasteModeRef.current }))
                     .catch(console.error);
                 });
               } else {
@@ -922,6 +935,9 @@ export default function VelocePage() {
         if (typeof saved.gpuEnabled === "boolean") setGpuEnabled(saved.gpuEnabled);
         if (typeof saved.clipboardMode === "boolean") setClipboardMode(saved.clipboardMode);
         if (typeof saved.clipboardAutoPaste === "boolean") setClipboardAutoPaste(saved.clipboardAutoPaste);
+        if (saved.autoPasteMode === "ctrl_v" || saved.autoPasteMode === "ctrl_shift_v" || saved.autoPasteMode === "type_text") {
+          setAutoPasteMode(saved.autoPasteMode);
+        }
         if (typeof saved.showResponseTimes === "boolean") setShowResponseTimes(saved.showResponseTimes);
         if (saved.toggleWidgetCombo === null || typeof saved.toggleWidgetCombo === "object") {
           setToggleWidgetCombo(saved.toggleWidgetCombo ?? DEFAULT_TOGGLE_WIDGET);
@@ -956,6 +972,7 @@ export default function VelocePage() {
         gpuEnabled,
         clipboardMode,
         clipboardAutoPaste,
+        autoPasteMode,
         showResponseTimes,
         closeToMiniWidget,
         showFloatingWidget,
@@ -979,6 +996,7 @@ export default function VelocePage() {
     gpuEnabled,
     clipboardMode,
     clipboardAutoPaste,
+    autoPasteMode,
     showResponseTimes,
     closeToMiniWidget,
     showFloatingWidget,
@@ -1111,9 +1129,13 @@ export default function VelocePage() {
   useEffect(() => {
     if (!settingsLoaded) return;
 
-    safeInvoke("set_clipboard_settings", { enabled: clipboardMode, autoPaste: clipboardAutoPaste })
+    safeInvoke("set_clipboard_settings", {
+      enabled: clipboardMode,
+      autoPaste: clipboardAutoPaste,
+      autoPasteMode,
+    })
       .catch((error) => console.error("Failed to sync clipboard mode", error));
-  }, [settingsLoaded, clipboardMode, clipboardAutoPaste]);
+  }, [settingsLoaded, clipboardMode, clipboardAutoPaste, autoPasteMode]);
 
   useEffect(() => {
     if (!settingsLoaded) return;
@@ -1156,6 +1178,10 @@ export default function VelocePage() {
     if (!enabled) {
       setClipboardAutoPaste(false);
     }
+  };
+
+  const handleAutoPasteModeChange = (mode: AutoPasteMode) => {
+    setAutoPasteMode(mode);
   };
 
   const handleRefreshHardware = useCallback(async () => {
@@ -1232,6 +1258,7 @@ export default function VelocePage() {
           gpuEnabled,
           clipboardMode,
           clipboardAutoPaste,
+          autoPasteMode,
           showResponseTimes,
           closeToMiniWidget,
           showFloatingWidget,
@@ -1259,6 +1286,7 @@ export default function VelocePage() {
     gpuEnabled,
     clipboardMode,
     clipboardAutoPaste,
+    autoPasteMode,
     showResponseTimes,
     closeToMiniWidget,
     showFloatingWidget,
@@ -1415,6 +1443,8 @@ export default function VelocePage() {
                   onClipboardModeChange={toggleClipboard}
                   clipboardAutoPaste={clipboardAutoPaste}
                   onClipboardAutoPasteChange={setClipboardAutoPaste}
+                  autoPasteMode={autoPasteMode}
+                  onAutoPasteModeChange={handleAutoPasteModeChange}
                   onRefreshHardware={handleRefreshHardware}
                   onSave={handleSaveSettings}
                   className="flex-1 rounded-b-3xl"

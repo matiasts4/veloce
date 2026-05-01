@@ -82,19 +82,10 @@ def setup_logging():
     return log_file
 
 
-# VAD & Diarization imports
-try:
-    from sklearn.cluster import AgglomerativeClustering
-    from sklearn.metrics import silhouette_score
-except Exception:
-    pass
-
-try:
-    from speechbrain.inference.speaker import EncoderClassifier
-except Exception:
-    pass
-
-# Global VAD/Diarization models (lazy loaded)
+# VAD & Diarization models (lazy loaded)
+# NOTE: sklearn and speechbrain are imported lazily inside the methods that use
+# them so that the Python process does not pay their import cost (~400MB) at
+# startup when diarization is disabled.
 vad_model = None
 vad_utils = None
 diarization_model = None
@@ -196,7 +187,7 @@ class DiarizationManager:
 
     def _load_model(self):
         try:
-            from speechbrain.inference.speaker import EncoderClassifier
+            from speechbrain.inference.speaker import EncoderClassifier  # lazy import
         except Exception as e:
             emit({"log": f"Diarization: SpeechBrain not available or error: {e}"})
             return
@@ -1571,8 +1562,11 @@ def load_whisper(model_name, prefer_gpu):
                 emit({"log": f"Found faster-whisper model root in custom directory: {target_path}"})
 
         cpu_count = os.cpu_count() or 4
-        cpu_threads = max(4, cpu_count)
-        num_workers = min(2, cpu_count // 2)
+        # min(4, cpu_count): enough for real-time audio; max() inflated thread-local buffers
+        cpu_threads = min(4, cpu_count)
+        # num_workers=1: CT2 inter_threads — each extra worker duplicates the full model in RAM.
+        # For a single real-time audio stream, one worker is sufficient.
+        num_workers = 1
         emit({"log": f"Loading WhisperModel: {target_path} | device={device} compute={compute_type} threads={cpu_threads} workers={num_workers}"})
         loaded = WhisperModel(target_path, device=device, compute_type=compute_type, cpu_threads=cpu_threads, num_workers=num_workers)
 
@@ -1613,21 +1607,22 @@ def load_backend(model_name, prefer_gpu, backend_name):
     
     with backend_load_lock:
         requested_backend = resolve_backend(model_name, prefer_gpu, backend_name)
-        
-        # Avoid redundant reloads — compare by actual assigned backend type to prevent infinite fallback loops
-        # This prevents infinite loops when a fallback occurs (e.g., whispercpp -> faster-whisper)
-        if (loaded_model == model_name and 
-            loaded_gpu == prefer_gpu and 
-            loaded_backend_type == backend_name and 
+
+        # Avoid redundant reloads — compare by RESOLVED backend (not the raw name).
+        # "auto" and "faster-whisper" can both resolve to the same backend; treating
+        # them as different would cause unnecessary reloads on startup CONFIG bursts.
+        if (loaded_model == model_name and
+            loaded_gpu == prefer_gpu and
+            active_backend == requested_backend and
             active_backend != "none"):
-            
+
             # Additional check for backend health
             if active_backend == "whispercpp" and is_whisper_server_ready():
-                 emit({"status": "ready"})
-                 return model_name
+                emit({"status": "ready"})
+                return model_name
             elif active_backend == "faster-whisper" and model_whisper is not None:
-                 emit({"status": "ready"})
-                 return model_name
+                emit({"status": "ready"})
+                return model_name
 
         chosen_backend = requested_backend
 
@@ -2251,7 +2246,11 @@ def main():
     # Initialize VAD and StreamProcessor
     emit({"log": "Initializing VAD and StreamProcessor..."})
     global diarization_manager
-    diarization_manager = DiarizationManager()
+    # DiarizationManager loads SpeechBrain ECAPA-VoxCeleb (~300MB).
+    # Only instantiate when diarization is actually enabled — the feature
+    # is currently disabled (speaker assignment call is commented out).
+    # diarization_manager = DiarizationManager()
+    diarization_manager = None
     
     vad = VADDetector()
     processor = StreamProcessor(vad, chunk_size=CHUNK, sample_rate=RATE)
@@ -2545,7 +2544,17 @@ def command_listener():
                 model_changed = model != selected_model
                 model_dir_changed = model_dir != selected_model_dir
                 gpu_changed = prefer_gpu != gpu_enabled
-                backend_changed = backend != selected_backend
+                # Compare RESOLVED backends to avoid false positives when "auto" and
+                # "faster-whisper" refer to the same actual backend.
+                # Use selected_backend (previous config value) NOT active_backend
+                # (which is pre-initialized to "faster-whisper" and would prevent the
+                # very first load from ever triggering).
+                prev_resolved = resolve_backend(selected_model, gpu_enabled, selected_backend)
+                new_resolved = resolve_backend(model, prefer_gpu, backend)
+                backend_changed = new_resolved != prev_resolved
+                # If nothing is loaded yet, always trigger a load regardless of flags.
+                nothing_loaded = loaded_model == "" or model_whisper is None
+
                 selected_language = language
                 gpu_enabled = prefer_gpu
                 selected_backend = backend
@@ -2554,13 +2563,13 @@ def command_listener():
                 if selected_model_dir:
                     os.environ["WHISPERCPP_MODEL_DIR"] = selected_model_dir
 
-                if model_changed or model_dir_changed or gpu_changed or backend_changed:
+                if nothing_loaded or model_changed or model_dir_changed or gpu_changed or backend_changed:
                     selected_model = model
                     emit({"log": f"Engine config updated [{config_uuid}] (async load pending)"})
                     load_backend_async(selected_model, gpu_enabled, selected_backend)
                 else:
                     selected_model = model
-                    emit({"log": f"Engine config updated [{config_uuid}] (no change)"})
+                    emit({"log": f"Engine config updated [{config_uuid}] (no change — skipping reload)"})
                     emit(get_hardware_info())
 
             except Exception as e:

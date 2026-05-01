@@ -92,15 +92,13 @@ export default function PillPage() {
       const { safeInvoke } = await import("@/lib/tauri-client");
       await safeInvoke("hide_pill");
 
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
       // Signal the main window to show itself
       const { emit } = await import("@tauri-apps/api/event");
       await emit("show-window");
 
       // Also try to show main directly
-      const { getAll } = await import("@tauri-apps/api/window");
-      const windows = await getAll();
-      const mainWin = windows.find((w) => w.label === "main");
+      const { Window } = await import("@tauri-apps/api/window");
+      const mainWin = await Window.getByLabel("main");
       if (mainWin) {
         await mainWin.show();
         await mainWin.unminimize();
