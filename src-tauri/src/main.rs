@@ -6,6 +6,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::menu::{Menu, MenuItem};
 use tauri::image::Image;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 mod state;
@@ -151,7 +152,9 @@ fn main() {
             set_startup_enabled,
             install_audio_engine,
             update_tray_icon,
-            set_tray_visible
+            set_tray_visible,
+            reload_word_dictionary,
+            write_word_dictionary
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -311,20 +314,44 @@ fn type_text(text: String) -> Result<(), String> {
 }
 
 fn press_paste_shortcut_for_mode(mode: AutoPasteMode) -> Result<(), String> {
+    if mode == AutoPasteMode::TypeText {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, prefer xdotool because it correctly handles modifier
+        // sequences (e.g. ctrl+shift+v) via the X11 keyboard layer.
+        // enigo's xtest_fake_input sends raw keycodes that can produce
+        // wrong keysyms when Shift is held, breaking ctrl+shift+v.
+        let shortcut = match mode {
+            AutoPasteMode::CtrlV => "ctrl+v",
+            AutoPasteMode::CtrlShiftV => "ctrl+shift+v",
+            AutoPasteMode::TypeText => return Ok(()),
+        };
+
+        match std::process::Command::new("xdotool")
+            .args(["key", shortcut])
+            .output()
+        {
+            Ok(output) if output.status.success() => return Ok(()),
+            _ => {
+                // xdotool not available or failed; fall through to enigo
+            }
+        }
+    }
+
     use enigo::{Direction, Enigo, Key, Keyboard, Settings};
     let mut enigo = match Enigo::new(&Settings::default()) {
         Ok(instance) => instance,
         Err(_) => return Err("Failed to init enigo".to_string()),
     };
 
-    if mode == AutoPasteMode::TypeText {
-        return Ok(());
-    }
-
     let _ = enigo.key(Key::Control, Direction::Press);
 
     if mode == AutoPasteMode::CtrlShiftV {
         let _ = enigo.key(Key::Shift, Direction::Press);
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     let _ = enigo.key(Key::Unicode('v'), Direction::Click);
@@ -450,6 +477,36 @@ fn set_startup_enabled(enabled: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn reload_word_dictionary(state: tauri::State<AppState>) -> Result<(), String> {
+    let cmd = "RELOAD_DICT\n";
+    if let Err(error) = engine::write_engine_command(&state, cmd) {
+        return Err(format!("No se pudo enviar comando al motor: {}", error));
+    }
+    Ok(())
+}
+
+fn get_dictionary_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("veloce")
+        .join("word_dictionary.json")
+}
+
+#[tauri::command]
+fn write_word_dictionary(state: tauri::State<AppState>, json: String) -> Result<(), String> {
+    use std::fs;
+    let final_path = get_dictionary_path();
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| "dictionary path has no parent".to_string())?;
+    let tmp_path = final_path.with_extension("json.tmp");
+    fs::create_dir_all(parent).map_err(|e| format!("create_dir_all failed: {e}"))?;
+    fs::write(&tmp_path, json.as_bytes()).map_err(|e| format!("write tmp failed: {e}"))?;
+    fs::rename(&tmp_path, &final_path).map_err(|e| format!("rename failed: {e}"))?;
+    engine::write_engine_command(&state, "RELOAD_DICT\n")
+}
+
+#[tauri::command]
 async fn download_model(app: AppHandle, state: tauri::State<'_, AppState>, model: String, download_dir: Option<String>) -> Result<(), String> {
     let model = model.trim().to_string();
     if model.is_empty() {
@@ -531,3 +588,5 @@ mod tests {
         assert!(press_paste_shortcut_for_mode(AutoPasteMode::TypeText).is_ok());
     }
 }
+// Force rebuild after audio_engine.py fix
+// Rebuild after transcription_worker global fix
