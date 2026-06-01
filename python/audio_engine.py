@@ -899,15 +899,31 @@ def _detect_case_style(word: str) -> str:
 
 
 def _apply_case_style(replacement: str, style: str) -> str:
-    """Render the user's `to` value using the source token's case style."""
+    """Render the user's `to` value using the source token's case style.
+
+    Per spec:
+    - ``upper``  → ALL UPPERCASE
+    - ``title``  → per-word Title Case (e.g. ``tauri inc`` → ``Tauri Inc``).
+      Mixed separators are preserved: ``tauri-DEV`` → ``Tauri-Dev``.
+    - ``lower``  → user's ``to`` as-is (the user controls the case; do not lowercase)
+    - ``as-is``  → user's ``to`` as-is
+    """
     if style == "upper":
         return replacement.upper()
     if style == "title":
         if not replacement:
             return replacement
-        return replacement[0].upper() + replacement[1:].lower()
+        # Per-word Title Case: capitalize the first letter of each contiguous
+        # letter run, lowercase the rest. Preserves any non-letter separators
+        # (spaces, hyphens, dots) verbatim.
+        return re.sub(
+            r"[A-Za-z]+",
+            lambda m: m.group(0)[:1].upper() + m.group(0)[1:].lower(),
+            replacement,
+        )
     if style == "lower":
-        return replacement.lower()
+        # Spec: lower source → user's `to` as-is. Do NOT lowercase.
+        return replacement
     return replacement
 
 
@@ -2316,44 +2332,48 @@ def transcribe_segment(audio_data, is_final=False, retry_on_cpu=True):
 def transcription_worker():
     global stopping
     """Background thread to process transcription jobs synchronously one by one.
-    
-    Immediate-stop mode: when the STOP command is issued, the `stopping` global flag
-    is set. This causes the worker to emit 'stopped' immediately WITHOUT waiting for
-    the transcription queue to drain. This eliminates the ~5s paste delay that occurred
-    when multiple segments were queued at stop time.
+
+    Drain semantics: when STOP is pressed, the worker first drains any pending
+    transcription jobs so their results are not lost, then emits
+    ``{"status": "stopped"}`` exactly once on the final iteration when both
+    ``recording`` and ``stopping`` are False AND the queue is empty. The terminal
+    ``stopped`` event is gated on a finally block that fires for ALL job types
+    (real jobs AND the ``STOP`` marker), so the UI returns to idle exactly once.
     """
     emit({"log": "Transcription worker thread started."})
     while True:
         try:
-            # Immediate-stop check: if STOP was pressed, emit "stopped" right away
-            # without processing any queued transcription jobs. This is the key fix
-            # for the ~5s paste delay on stop.
+            # If STOP was pressed, reset the flag and fall through to drain any
+            # queued transcription jobs. The terminal "stopped" event fires from
+            # the inner finally once the queue is fully drained and the session
+            # is no longer active.
             if stopping:
-                emit({"log": "Stop signal received. Emitting stopped immediately (skipping queue drain)."})
-                emit({"status": "stopped"})
-                stopping = False  # Reset for next recording session
-                continue  # Skip the queue get — don't process any more jobs
+                emit({"log": "Stop signal received. Draining queue before emitting stopped."})
+                stopping = False
+                # fall through to process the remaining queue
 
             try:
                 job = transcription_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
-            if job is None:
-                # Poison pill received, ignore and continue
-                pass
-            elif job.get("type") == "STOP":
-                # The `stopping` flag already emitted "stopped" immediately when STOP
-                # was pressed. This job is just a synchronization marker from the main
-                # loop; do NOT emit "stopped" again to avoid double-paste in the UI.
-                emit({"log": "Transcription queue drained. Stop signal was already emitted via stopping flag."})
-                pass
-            else:
-                try:
+            # The job dispatch is wrapped in try/finally so the drain check
+            # fires for ALL job types (including the STOP marker), not only
+            # real transcription segments.
+            try:
+                if job is None:
+                    # Poison pill received, ignore and continue
+                    pass
+                elif job.get("type") == "STOP":
+                    # Synchronization marker from the main loop. The drain check
+                    # in the finally below will emit "stopped" once the queue is
+                    # empty and the session is no longer active.
+                    emit({"log": "Transcription queue drained. Stop marker consumed."})
+                else:
                     emit({"status": "transcribing_final"})
                     if job.get("is_empty_drop", False):
                          # If it was an empty drop from VAD, just emit empty text so React resets to idle.
                          emit({
-                             "transcription": "", 
+                             "transcription": "",
                              "is_final": True,
                              "recording_id": current_recording_id,
                              "speaker": None,
@@ -2361,15 +2381,16 @@ def transcription_worker():
                          })
                     else:
                          transcribe_segment(job["audio"], is_final=job.get("is_final", True))
-                except Exception as e:
-                    emit({"error": f"Error transcribing segment: {e}"})
-                finally:
-                    # Switch back to listening if still active
-                    if stopping:
-                        # Don't emit listening if we're stopping — let stopped event drive UI to idle
-                        pass
-                    elif recording:
-                        emit({"status": "listening"})
+            except Exception as e:
+                emit({"error": f"Error processing job: {e}"})
+            finally:
+                # Switch back to listening if the session is still active, OR
+                # emit "stopped" once the queue is fully drained.
+                if recording:
+                    emit({"status": "listening"})
+                elif transcription_queue.empty() and not stopping:
+                    # Drain complete and not in an active session — terminal status.
+                    emit({"status": "stopped"})
             transcription_queue.task_done()
         except Exception as e:
             emit({"error": f"Worker loop error: {e}"})
