@@ -68,7 +68,7 @@ except Exception:
 
 # Setup logging
 def setup_logging():
-    app_data = Path(os.environ.get("APPDATA", ".")) / "Veloce"
+    app_data = get_app_data_dir()
     app_data.mkdir(parents=True, exist_ok=True)
     log_file = app_data / "audio_engine_debug.log"
     
@@ -318,9 +318,11 @@ EDGE_HALLUCINATION_PHRASES = [
 ]
 
 # Globals
+word_substitutions: dict[str, str] = {}
 recording = False
 current_recording_id = 0
 session_transcript = ""  # Accumulates all final phrases for the active recording session
+stopping = False  # Flag for immediate-stop mode: when True, worker emits "stopped" without draining queue
 debug_callback_count = 0
 debug_process_count = 0
 audio_queue = queue.Queue()
@@ -846,6 +848,86 @@ def get_app_data_dir() -> Path:
         return Path.home() / "Library" / "Application Support" / "Veloce"
     else:
         return Path.home() / ".config" / "veloce"
+
+def get_dictionary_path() -> Path:
+    if sys.platform == "win32":
+        return Path(os.environ["APPDATA"]) / "Veloce" / "word_dictionary.json"
+    elif sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Veloce" / "word_dictionary.json"
+    else:
+        return Path.home() / ".config" / "veloce" / "word_dictionary.json"
+
+def load_word_dictionary():
+    global word_substitutions
+    dict_path = get_dictionary_path()
+    if dict_path.exists():
+        try:
+            with open(dict_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                word_substitutions = {
+                    entry["from"].lower(): entry["to"]
+                    for entry in data.get("substitutions", [])
+                    if entry.get("from") and entry.get("to")
+                }
+            emit({"log": f"Word dictionary loaded: {len(word_substitutions)} entries"})
+        except Exception as e:
+            emit({"log": f"Failed to load word dictionary: {e}"})
+            word_substitutions = {}
+    else:
+        word_substitutions = {}
+
+def _detect_case_style(word: str) -> str:
+    """Classify the case style of a single word.
+
+    Returns one of: "upper" (ALL UPPERCASE, multi-char), "title" (first char
+    upper, rest lower), "lower" (all lowercase), or "as-is" (mixed, non-Latin,
+    empty, or single non-letter char).
+
+    Each token is classified independently — the same word in different
+    positions may have different case in the transcript (e.g. "tauri" and
+    "TAURI") and is handled per-occurrence.
+    """
+    if not word or not word[0].isalpha():
+        return "as-is"
+    if word.isupper() and len(word) > 1:
+        return "upper"
+    if word[0].isupper() and (len(word) == 1 or word[1:].islower()):
+        return "title"
+    if word.islower():
+        return "lower"
+    return "as-is"
+
+
+def _apply_case_style(replacement: str, style: str) -> str:
+    """Render the user's `to` value using the source token's case style."""
+    if style == "upper":
+        return replacement.upper()
+    if style == "title":
+        if not replacement:
+            return replacement
+        return replacement[0].upper() + replacement[1:].lower()
+    if style == "lower":
+        return replacement.lower()
+    return replacement
+
+
+def apply_word_substitutions(text: str) -> str:
+    if not word_substitutions:
+        return text
+    # Strip common punctuation for matching, but preserve original spacing/punctuation in output
+    PUNCT = '.,;:!?¡¿¿—\'"()[]{}'
+    words = text.split()
+    corrected = []
+    for w in words:
+        key = w.lower().strip(PUNCT)
+        if key in word_substitutions:
+            # Preserve the source token's case style in the replacement.
+            # Mixed-case and non-Latin tokens fall through to "as-is" (verbatim).
+            style = _detect_case_style(w)
+            corrected.append(_apply_case_style(word_substitutions[key], style))
+        else:
+            corrected.append(w)
+    return " ".join(corrected)
 
 def get_writable_models_dir() -> Path:
     return get_app_data_dir() / "models"
@@ -1932,7 +2014,8 @@ class StreamProcessor:
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         
-        self.speech_buffer = []
+        self.speech_buffer = deque(maxlen=int(120 * RATE / 512))  # Bounded to ~120s of audio chunks
+        self._last_partial_total_samples = 0  # Total samples transcribed in last partial — tracks delta window
         self.is_speech_active = False
         self.speech_start_time = 0
         self.last_speech_time = 0
@@ -2005,9 +2088,10 @@ class StreamProcessor:
                 "is_final": True,
                 "is_empty_drop": True
             })
-            self.speech_buffer = []
+            self.speech_buffer.clear()  # Clear deque in-place to preserve maxlen bound
             self.accumulated_audio_duration = 0
             self.last_partial_time = 0
+            self._last_partial_total_samples = 0
             return
             
         # Dispatch immediately to background worker
@@ -2017,13 +2101,14 @@ class StreamProcessor:
         })
         
         if is_final_flush:
-            self.speech_buffer = []
+            self.speech_buffer.clear()
         else:
-            self.speech_buffer = []
+            self.speech_buffer.clear()
             
         self.accumulated_audio_duration = 0
         self.last_partial_time = 0
         self.silence_counter = 0
+        self._last_partial_total_samples = 0
         
         # if recording:
         #     emit({"status": "listening"}) 
@@ -2034,15 +2119,56 @@ class StreamProcessor:
             self.finalize_segment(is_final_flush=True)
 
     def _transcribe_partial(self):
+        """Transcribe only the NEW audio delta since last partial, not the full buffer.
+
+        This is the key optimization: instead of re-transcribing the full accumulated
+        buffer on every partial update (which causes O(n) cumulative work), we only
+        send the ~1.5-2s of new audio that arrived since the last partial.
+
+        _last_partial_total_samples tracks how many samples had been accumulated when
+        the last partial ran. The delta is the new samples beyond that count.
+        This works correctly even when the deque evicts old chunks via maxlen.
+        """
         if not self.speech_buffer:
             return
-        # Take a copy to avoid threading issues if buffer changes during async call
-        # (though Python GIL usually protects basic list ops, concatenation is safer)
-        current_audio = np.concatenate(self.speech_buffer)
-        
+
+        # Total samples currently in buffer
+        current_total = sum(len(c) for c in self.speech_buffer)
+
+        # Compute delta: new samples since last partial
+        if current_total <= self._last_partial_total_samples:
+            # Buffer wrapped or no new data — reset tracking
+            self._last_partial_total_samples = 0
+
+        delta_sample_count = current_total - self._last_partial_total_samples
+        if delta_sample_count <= 0:
+            return
+
+        # Build delta audio by taking the newest chunks until we reach delta_sample_count
+        delta_chunks = []
+        samples_needed = delta_sample_count
+        for chunk in reversed(self.speech_buffer):
+            delta_chunks.insert(0, chunk)
+            samples_needed -= len(chunk)
+            if samples_needed <= 0:
+                break
+
+        if not delta_chunks:
+            return
+
+        # Enforce minimum 0.5s of new audio to avoid tiny/empty transcriptions
+        delta_duration = sum(len(c) for c in delta_chunks) / self.sample_rate
+        if delta_duration < 0.5:
+            return
+
+        delta_audio = np.concatenate(delta_chunks)
+
+        # Advance tracking: mark total samples at end of this partial
+        self._last_partial_total_samples = current_total
+
         # Run in thread to not block audio processing loop
         # We don't put partials in the queue to avoid blocking finals
-        threading.Thread(target=transcribe_segment, args=(current_audio, False), daemon=True).start()
+        threading.Thread(target=transcribe_segment, args=(delta_audio, False), daemon=True).start()
 
 def transcribe_segment(audio_data, is_final=False, retry_on_cpu=True):
     # This replaces the old transcribe() function logic but adapted
@@ -2124,7 +2250,9 @@ def transcribe_segment(audio_data, is_final=False, retry_on_cpu=True):
             audio_float32,
             beam_size=1, # Faster for partials
             best_of=1,
-            condition_on_previous_text=True, # Allow context to flow across chunks
+            # Disable KV-cache growth that causes unbounded RAM usage in long sessions.
+            # Delta-only partials mean we don't need cross-chunk context anyway.
+            condition_on_previous_text=False,
             vad_filter=False, # We already did VAD, don't let whisper's internal VAD filter out partials
             language=None if selected_language == "auto" else selected_language,
             task=effective_task
@@ -2186,17 +2314,39 @@ def transcribe_segment(audio_data, is_final=False, retry_on_cpu=True):
         emit({"error": f"Transcribe error: {e}"})
 
 def transcription_worker():
-    """Background thread to process transcription jobs synchronously one by one."""
+    global stopping
+    """Background thread to process transcription jobs synchronously one by one.
+    
+    Immediate-stop mode: when the STOP command is issued, the `stopping` global flag
+    is set. This causes the worker to emit 'stopped' immediately WITHOUT waiting for
+    the transcription queue to drain. This eliminates the ~5s paste delay that occurred
+    when multiple segments were queued at stop time.
+    """
     emit({"log": "Transcription worker thread started."})
     while True:
         try:
-            job = transcription_queue.get()
+            # Immediate-stop check: if STOP was pressed, emit "stopped" right away
+            # without processing any queued transcription jobs. This is the key fix
+            # for the ~5s paste delay on stop.
+            if stopping:
+                emit({"log": "Stop signal received. Emitting stopped immediately (skipping queue drain)."})
+                emit({"status": "stopped"})
+                stopping = False  # Reset for next recording session
+                continue  # Skip the queue get — don't process any more jobs
+
+            try:
+                job = transcription_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
             if job is None:
                 # Poison pill received, ignore and continue
                 pass
             elif job.get("type") == "STOP":
-                emit({"log": "Transcription queue drained. Emitting final stop signal."})
-                emit({"status": "stopped"})
+                # The `stopping` flag already emitted "stopped" immediately when STOP
+                # was pressed. This job is just a synchronization marker from the main
+                # loop; do NOT emit "stopped" again to avoid double-paste in the UI.
+                emit({"log": "Transcription queue drained. Stop signal was already emitted via stopping flag."})
+                pass
             else:
                 try:
                     emit({"status": "transcribing_final"})
@@ -2215,7 +2365,10 @@ def transcription_worker():
                     emit({"error": f"Error transcribing segment: {e}"})
                 finally:
                     # Switch back to listening if still active
-                    if recording:
+                    if stopping:
+                        # Don't emit listening if we're stopping — let stopped event drive UI to idle
+                        pass
+                    elif recording:
                         emit({"status": "listening"})
             transcription_queue.task_done()
         except Exception as e:
@@ -2227,6 +2380,7 @@ def main():
     emit(get_hardware_info())
     emit({"log": f"Initial backend load: model={selected_model}, gpu={gpu_enabled}, backend={selected_backend}"})
     load_backend(selected_model, gpu_enabled, selected_backend)
+    load_word_dictionary()
 
     try:
         emit({"log": f"Warming up audio stream for device {selected_device}"})
@@ -2314,6 +2468,42 @@ def extract_whispercpp_text(stdout: str) -> str:
     return " ".join(lines).strip()
 
 
+def _strip_trailing_stutter(text: str) -> str:
+    """Strip repeated-word stuttering from the END of text. Case-insensitive.
+    
+    E.g. "gracias gracias" → "gracias", "Y Y Y" → "Y", "si si si" → "si".
+    Only the trailing stutter chain is removed — occurrences of words in the
+    MIDDLE of the text are preserved.
+    
+    This handles hallucinated repeated words like "gracias gracias" and "Y Y Y"
+    that appear at segment boundaries.
+    """
+    if not text:
+        return text
+    
+    words = text.split()
+    if len(words) < 2:
+        return text
+    
+    # Count consecutive identical words from the end (case-insensitive)
+    last_word_lower = words[-1].lower()
+    count = 1
+    for i in range(len(words) - 2, -1, -1):
+        if words[i].lower() == last_word_lower:
+            count += 1
+        else:
+            break
+    
+    if count >= 2:
+        # Keep only the first occurrence of the stutter chain
+        # words[:-count] = all words before the stutter chain
+        # words[-count:] = the stutter chain (all same word)
+        # words[-count] = first occurrence of the stuttered word (kept)
+        return " ".join(words[:-count] + [words[-count]]).strip()
+    
+    return text
+
+
 def cleanup_transcription_text(text: str, duration_s: float) -> str:
     normalized = re.sub(r"\s+", " ", text or "").strip()
     if not normalized:
@@ -2321,38 +2511,43 @@ def cleanup_transcription_text(text: str, duration_s: float) -> str:
 
     lowered = normalized.lower().strip(" .,!?:;¡!¿?\"'`[]()")
 
-    # Exact match for common hallucinations in short chunks.
-    if duration_s <= 20.0 and (lowered in GRATITUDE_PHRASES or lowered in EDGE_HALLUCINATION_PHRASES):
+    # Exact match for common hallucinations — apply to ALL segments regardless of
+    # duration. Hallucinations occur at segment boundaries regardless of length.
+    if lowered in GRATITUDE_PHRASES or lowered in EDGE_HALLUCINATION_PHRASES:
         return ""
 
     words = normalized.split()
-    # Check suffixes/prefixes if there's enough context (or any length really, whisper can append just one word)
+    # Check suffixes/prefixes for gratitude phrases — apply to ALL segments.
     if len(words) >= 2:
         for phrase in GRATITUDE_PHRASES:
             prefix_pattern = re.compile(rf"^[\s\.,;:!\?¡¿-]*{re.escape(phrase)}[\s\.,;:!\?¡¿-]+", re.IGNORECASE)
             suffix_pattern = re.compile(rf"[\s\.,;:!\?¡¿-]+{re.escape(phrase)}[\s\.,;:!\?¡¿-]*$", re.IGNORECASE)
 
-            if duration_s <= 24.0:
-                old_norm = None
-                while old_norm != normalized:
-                    old_norm = normalized
-                    normalized = prefix_pattern.sub("", normalized).strip()
-                    normalized = suffix_pattern.sub("", normalized).strip()
+            # Remove all occurrences — no duration gate (hallucinations occur at any length)
+            old_norm = None
+            while old_norm != normalized:
+                old_norm = normalized
+                normalized = prefix_pattern.sub("", normalized).strip()
+                normalized = suffix_pattern.sub("", normalized).strip()
 
     # Remove frequent hallucinated tail/opening chunks (e.g. "un saludo", "al final")
-    # only when they are detached at the edges of short segments.
-    if duration_s <= 18.0:
-        for phrase in EDGE_HALLUCINATION_PHRASES:
-            edge_prefix = re.compile(rf"^[\s\.,;:!\?¡¿\-\"]*{re.escape(phrase)}[\s\.,;:!\?¡¿\-\"]+", re.IGNORECASE)
-            edge_suffix = re.compile(rf"[\s\.,;:!\?¡¿\-\"]+{re.escape(phrase)}[\s\.,;:!\?¡¿\-\"]*$", re.IGNORECASE)
+    # Apply to ALL segments — hallucinations at edges are independent of segment length.
+    for phrase in EDGE_HALLUCINATION_PHRASES:
+        edge_prefix = re.compile(rf"^[\s\.,;:!\?¡¿\-\"]*{re.escape(phrase)}[\s\.,;:!\?¡¿\-\"]+", re.IGNORECASE)
+        edge_suffix = re.compile(rf"[\s\.,;:!\?¡¿\-\"]+{re.escape(phrase)}[\s\.,;:!\?¡¿\-\"]*$", re.IGNORECASE)
 
-            previous = None
-            while previous != normalized:
-                previous = normalized
-                normalized = edge_prefix.sub("", normalized).strip()
-                normalized = edge_suffix.sub("", normalized).strip()
+        previous = None
+        while previous != normalized:
+            previous = normalized
+            normalized = edge_prefix.sub("", normalized).strip()
+            normalized = edge_suffix.sub("", normalized).strip()
 
-    return normalized
+    # Strip repeated-word stuttering at end of segment (e.g. "gracias gracias", "Y Y Y")
+    normalized = _strip_trailing_stutter(normalized)
+
+    # Apply user word substitutions
+    text = apply_word_substitutions(normalized)
+    return text
 
 
 def transcribe_whispercpp(audio_int16: np.ndarray, language: str, is_final: bool = True) -> tuple[str, str | None]:
@@ -2433,7 +2628,7 @@ def transcribe_whispercpp(audio_int16: np.ndarray, language: str, is_final: bool
 
 
 def command_listener():
-    global recording, selected_device, selected_model, selected_model_dir, selected_language, gpu_enabled, selected_backend, current_recording_id, session_transcript
+    global recording, selected_device, selected_model, selected_model_dir, selected_language, gpu_enabled, selected_backend, current_recording_id, session_transcript, stopping
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -2466,20 +2661,28 @@ def command_listener():
                 continue
             current_recording_id += 1
             session_transcript = ""  # Reset session buffer on new recording
+            stopping = False  # Reset stop flag for new session
             recording = True
             inject_pre_roll_audio()
             emit({"status": "recording"})
         elif line == "STOP":
+            stopping = True  # Signal worker to flush immediately without queue drain
             recording = False
-            # We do NOT emit "stopped" here. 
+            # Clear pre-roll buffer so next session starts fresh — no stale audio
+            with pre_roll_lock:
+                pre_roll_chunks.clear()
+            # We do NOT emit "stopped" here.
             # The main loop detects recording=False, flushes the final audio chunk to the queue,
-            # and posts a {"type": "STOP"} message. The worker thread will emit "stopped" 
-            # only after ALL pending transcriptions are fully completed.
+            # and posts a {"type": "STOP"} message. The worker checks `stopping` first and
+            # emits "stopped" immediately without waiting for queue drain.
         elif line == "EXIT":
             emit({"log": "Received EXIT command. Shutting down."})
             break
         elif line == "HARDWARE":
             emit(get_hardware_info())
+        elif line == "RELOAD_DICT":
+            load_word_dictionary()
+            emit({"log": "Word dictionary reloaded"})
         elif line.startswith("CONFIG "):
             try:
                 payload = json.loads(line[len("CONFIG "):])
@@ -2571,6 +2774,8 @@ def command_listener():
                     selected_model = model
                     emit({"log": f"Engine config updated [{config_uuid}] (no change — skipping reload)"})
                     emit(get_hardware_info())
+
+                load_word_dictionary()
 
             except Exception as e:
                 emit({"error": f"Invalid CONFIG payload: {e}"})
