@@ -315,6 +315,18 @@ EDGE_HALLUCINATION_PHRASES = [
     "gracias gracias",
     "thank you",
     "thanks",
+    # "al canal" family — frequently hallucinated "subscribe to my channel" variants
+    # without "mi" or with typos. The Whisper model emits these on near-silence
+    # or at the end of recordings where a creator would say "subscribe to the channel".
+    "al canal",
+    "suscríbete al canal",
+    "suscribete al canal",
+    "subscribete al canal",
+    "suscríbanse al canal",
+    "subscribanse al canal",
+    "cánal",          # elongated "a" variant
+    "al canaal",      # double-elongated
+    "al canaaal",     # triple-elongated (just in case)
 ]
 
 # Globals
@@ -2568,6 +2580,16 @@ def cleanup_transcription_text(text: str, duration_s: float) -> str:
 
     # Apply user word substitutions
     text = apply_word_substitutions(normalized)
+
+    # Strip trailing exclamation marks and whitespace. Whisper frequently appends
+    # an isolated "!" to short segments (especially gratitude / "al canal" tails),
+    # which leaks into the final transcript and is rarely intended. Question marks
+    # and periods are preserved — those are more likely to be speaker-intended
+    # punctuation from the user. Exclamation strips are aggressive; the
+    # word-substitution step above can still emit "!" if the user's mapping ends
+    # with one (we re-apply the strip after substitutions to clean both sources).
+    text = text.rstrip("!").rstrip()
+
     return text
 
 
