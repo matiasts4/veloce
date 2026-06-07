@@ -309,7 +309,7 @@ export default function VelocePage() {
   );
 
   const dockMiniWidgetWindow = useCallback(async () => {
-    const [{ getCurrentWindow }, { LogicalPosition, LogicalSize }] = await Promise.all([
+    const [{ getCurrentWindow, currentMonitor }, { LogicalPosition, LogicalSize }] = await Promise.all([
       import("@tauri-apps/api/window"),
       import("@tauri-apps/api/dpi"),
     ]);
@@ -322,7 +322,7 @@ export default function VelocePage() {
     await window.show();
     await window.setSize(new LogicalSize(MINI_WIDTH, MINI_HEIGHT));
 
-    const monitor = await window.currentMonitor();
+    const monitor = await currentMonitor();
     if (monitor) {
       const margin = 12;
       const x = monitor.position.x + monitor.size.width - MINI_WIDTH - margin;

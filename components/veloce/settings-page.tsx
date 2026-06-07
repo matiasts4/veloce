@@ -13,6 +13,8 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
+import { Input } from "@/components/ui/input";
+import { loadWordDictionary, saveWordDictionary, isDictionaryEnabled, setDictionaryEnabled, type WordSub } from "@/lib/word-dictionary";
 import { KeybindRecorder } from "@/components/veloce/keybind-recorder";
 import type { HotkeyCombo } from "@/hooks/use-hotkey";
 import { ArrowLeft } from "lucide-react";
@@ -144,6 +146,10 @@ export function SettingsPage({
 }: SettingsPageProps) {
   const { t } = useTranslation();
   const [showDownloads, setShowDownloads] = useState(false);
+  const [wordSubs, setWordSubs] = useState<WordSub[]>([]);
+  const [dictEnabled, setDictEnabled] = useState(true);
+  const [newFrom, setNewFrom] = useState("");
+  const [newTo, setNewTo] = useState("");
 
   const recommendedModels: Array<{ id: string; name: string; downloaded: boolean; url?: string }> = [
     { id: "tiny", name: "Tiny — Más rápido", downloaded: false, url: "https://huggingface.co/Systran/faster-whisper-tiny" },
@@ -187,6 +193,12 @@ export function SettingsPage({
     setShowDownloads(downloadedOnly.length === 0);
   }, [downloadedOnly.length]);
 
+  useEffect(() => {
+    // Load word dictionary
+    loadWordDictionary().then(subs => setWordSubs(subs));
+    isDictionaryEnabled().then(enabled => setDictEnabled(enabled));
+  }, []);
+
   const mergedModelDirOptions = useMemo(() => {
     const options = Array.isArray(modelDirOptions) ? [...modelDirOptions] : [];
     if (modelDir && !options.includes(modelDir)) {
@@ -208,6 +220,29 @@ export function SettingsPage({
     { id: "faster-whisper", label: "faster-whisper" },
     { id: "whispercpp", label: "whisper.cpp" },
   ];
+
+  const handleAddWordSub = async () => {
+    if (!newFrom.trim() || !newTo.trim()) return;
+    const newSub = { from: newFrom.trim(), to: newTo.trim() };
+    // Remove any existing entry with same "from" key to avoid duplicates
+    const updated = [...wordSubs.filter(s => s.from.toLowerCase() !== newFrom.toLowerCase()), newSub];
+    setWordSubs(updated);
+    await saveWordDictionary(updated);
+    setNewFrom("");
+    setNewTo("");
+  };
+
+  const handleDeleteWordSub = async (from: string) => {
+    const updated = wordSubs.filter(s => s.from !== from);
+    setWordSubs(updated);
+    await saveWordDictionary(updated);
+  };
+
+  const handleDictToggle = async (enabled: boolean) => {
+    setDictEnabled(enabled);
+    await setDictionaryEnabled(enabled);
+  };
+
   const gpuStatusText = (() => {
     if (activeBackend === "whispercpp") {
       if (whispercppAvailable) {
@@ -842,6 +877,75 @@ export function SettingsPage({
               onCheckedChange={onShowResponseTimesChange}
               className="data-[state=checked]:bg-primary"
             />
+          </div>
+
+          {/* Word Corrections */}
+          <div className="space-y-3 border-t pt-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-medium">Correcciones de palabras</h3>
+                <p className="text-xs text-muted-foreground">
+                  Corrige palabras que el modelo interpreta mal
+                </p>
+              </div>
+              <Switch
+                checked={dictEnabled}
+                onCheckedChange={handleDictToggle}
+                className="data-[state=checked]:bg-primary"
+              />
+            </div>
+
+            {dictEnabled && (
+              <>
+                <div className="flex gap-2">
+                  <Input
+                    placeholder="Lo que dijiste"
+                    value={newFrom}
+                    onChange={e => setNewFrom(e.target.value)}
+                    className="flex-1"
+                  />
+                  <Input
+                    placeholder="Debería ser"
+                    value={newTo}
+                    onChange={e => setNewTo(e.target.value)}
+                    className="flex-1"
+                  />
+                  <Button
+                    size="sm"
+                    onClick={handleAddWordSub}
+                    disabled={!newFrom.trim() || !newTo.trim()}
+                  >
+                    Añadir
+                  </Button>
+                </div>
+
+                {wordSubs.length > 0 && (
+                  <div className="space-y-1">
+                    {wordSubs.map(sub => (
+                      <div key={sub.from} className="flex items-center justify-between text-sm py-1">
+                        <span>
+                          <span className="text-muted-foreground">"{sub.from}"</span>
+                          {" → "}
+                          <span>"{sub.to}"</span>
+                        </span>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleDeleteWordSub(sub.from)}
+                          className="h-6 px-2 text-muted-foreground hover:text-destructive"
+                        >
+                          ✕
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {wordSubs.length === 0 && (
+                  <p className="text-xs text-muted-foreground">No hay correcciones añadidas</p>
+                )}
+              </>
+            )}
           </div>
 
           <div className="pb-8">
