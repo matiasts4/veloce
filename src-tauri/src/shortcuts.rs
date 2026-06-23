@@ -1,7 +1,9 @@
-use tauri::{AppHandle, Runtime, Manager, Emitter};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutEvent, ShortcutState};
+use crate::engine;
 use crate::state::AppState;
-// Removed unused import: crate::engine
+use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri_plugin_global_shortcut::{
+    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutEvent, ShortcutState,
+};
 
 #[derive(serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -85,8 +87,8 @@ fn key_to_code(key: &str) -> Option<Code> {
 }
 
 pub fn shortcut_from_config(config: &HotkeyConfig) -> Result<Shortcut, String> {
-    let code = key_to_code(&config.key)
-        .ok_or_else(|| format!("Hotkey no soportada: {}", config.key))?;
+    let code =
+        key_to_code(&config.key).ok_or_else(|| format!("Hotkey no soportada: {}", config.key))?;
 
     let mut modifiers = Modifiers::empty();
     if config.ctrl_key {
@@ -129,6 +131,41 @@ pub fn register_capture_shortcut<R: Runtime>(
     Ok(())
 }
 
+fn send_shortcut_command<R: Runtime>(app: AppHandle<R>, recording: bool) {
+    let state = app.state::<AppState>();
+    let cmd = if recording { "START\n" } else { "STOP\n" };
+    let child_arc = state.sidecar_child.clone();
+    let recording_arc = state.recording.clone();
+
+    tauri::async_runtime::spawn(async move {
+        {
+            let lock = child_arc.lock().await;
+            if lock.is_none() {
+                drop(lock);
+                if let Err(error) = engine::spawn_audio_engine(&app, child_arc.clone()).await {
+                    let _ = app.emit("engine-error", error);
+                    let _ = app.emit("recording-state", false);
+                    if let Ok(mut r) = recording_arc.lock() {
+                        *r = false;
+                    }
+                    return;
+                }
+            }
+        }
+
+        if let Err(error) = engine::write_engine_command(&app.state::<AppState>(), cmd).await {
+            let _ = app.emit(
+                "engine-error",
+                format!("No se pudo enviar comando al motor de audio: {error}"),
+            );
+            let _ = app.emit("recording-state", false);
+            if let Ok(mut r) = recording_arc.lock() {
+                *r = false;
+            }
+        }
+    });
+}
+
 pub fn handle_shortcut<R: Runtime>(app: &AppHandle<R>, shortcut: &Shortcut, event: ShortcutEvent) {
     let state = app.state::<AppState>();
     let capture_shortcut = state
@@ -160,39 +197,20 @@ pub fn handle_shortcut<R: Runtime>(app: &AppHandle<R>, shortcut: &Shortcut, even
                 ShortcutState::Released => false,
             };
 
-            let mut recording = match state.recording.lock() {
-                Ok(lock) => lock,
-                Err(_) => return,
-            };
+            {
+                let mut recording = match state.recording.lock() {
+                    Ok(lock) => lock,
+                    Err(_) => return,
+                };
 
-            if *recording == target_recording {
-                return;
-            }
-
-            *recording = target_recording;
-            let cmd = if *recording { "START
-" } else { "STOP
-" };
-
-            // Direct engine call logic here to avoid circular dep
-             if let Ok(mut lock) = state.sidecar_child.lock() {
-                if let Some(child) = lock.as_mut() {
-                    if child.write(cmd.as_bytes()).is_err() {
-                        *lock = None;
-                        *recording = false;
-                        let _ = app.emit("recording-state", false);
-                        let _ = app.emit("engine-error", "No se pudo enviar comando al motor de audio");
-                        return;
-                    }
-                } else {
-                    *recording = false;
-                    let _ = app.emit("recording-state", false);
-                    let _ = app.emit("engine-error", "El motor de audio no está disponible");
+                if *recording == target_recording {
                     return;
                 }
+                *recording = target_recording;
             }
 
-            let _ = app.emit("recording-state", *recording);
+            let _ = app.emit("recording-state", target_recording);
+            send_shortcut_command(app.clone(), target_recording);
             return;
         }
 
@@ -200,34 +218,17 @@ pub fn handle_shortcut<R: Runtime>(app: &AppHandle<R>, shortcut: &Shortcut, even
             return;
         }
 
-        let mut recording = match state.recording.lock() {
-            Ok(lock) => lock,
-            Err(_) => return,
+        let new_recording = {
+            let mut recording = match state.recording.lock() {
+                Ok(lock) => lock,
+                Err(_) => return,
+            };
+            *recording = !*recording;
+            *recording
         };
-        *recording = !*recording;
 
-        let cmd = if *recording { "START
-" } else { "STOP
-" };
-
-        if let Ok(mut lock) = state.sidecar_child.lock() {
-            if let Some(child) = lock.as_mut() {
-                if child.write(cmd.as_bytes()).is_err() {
-                    *lock = None;
-                    *recording = false;
-                    let _ = app.emit("recording-state", false);
-                    let _ = app.emit("engine-error", "No se pudo enviar comando al motor de audio");
-                    return;
-                }
-            } else {
-                *recording = false;
-                let _ = app.emit("recording-state", false);
-                let _ = app.emit("engine-error", "El motor de audio no está disponible");
-                return;
-            }
-        }
-
-        let _ = app.emit("recording-state", *recording);
+        let _ = app.emit("recording-state", new_recording);
+        send_shortcut_command(app.clone(), new_recording);
         return;
     }
 

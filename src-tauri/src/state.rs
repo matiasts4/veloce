@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
-use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_global_shortcut::Shortcut;
+use tauri_plugin_shell::process::CommandChild;
+use tokio::sync::Mutex as TokioMutex;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct EngineSettings {
@@ -42,7 +43,7 @@ impl AutoPasteMode {
 }
 
 pub struct AppState {
-    pub sidecar_child: Arc<Mutex<Option<CommandChild>>>,
+    pub sidecar_child: Arc<TokioMutex<Option<CommandChild>>>,
     pub recording: Arc<Mutex<bool>>,
     pub capture_mode: Arc<Mutex<String>>,
     pub capture_shortcut: Arc<Mutex<Option<Shortcut>>>,

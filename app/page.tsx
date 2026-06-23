@@ -22,6 +22,8 @@ import {
   type HotkeyCombo,
   useHotkey,
 } from "@/hooks/use-hotkey";
+import { useStableListener } from "@/hooks/use-stable-listener";
+import { useEngineWatchdog } from "@/hooks/use-engine-watchdog";
 
 type Status = "idle" | "listening" | "processing" | "transcribing";
 type UiLanguage = "es" | "en";
@@ -173,12 +175,20 @@ export default function VelocePage() {
   const clipboardModeRef = useRef(clipboardMode);
   const clipboardAutoPasteRef = useRef(clipboardAutoPaste);
   const autoPasteModeRef = useRef<AutoPasteMode>(autoPasteMode);
+  const doneTickTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     clipboardModeRef.current = clipboardMode;
     clipboardAutoPasteRef.current = clipboardAutoPaste;
     autoPasteModeRef.current = autoPasteMode;
   }, [clipboardMode, clipboardAutoPaste, autoPasteMode]);
+
+  // Watchdog: if we are listening/transcribing but get no events for a while, reset the UI.
+  const { bump: bumpEngineWatchdog } = useEngineWatchdog(status, () => {
+    setStatus("idle");
+    setIsActive(false);
+    setEngineError(t("errors.engineStalled") || "El motor dejó de responder. Intenta reiniciar la grabación.");
+  });
 
   // Update tray icon based on recording state — reset when recording stops
   useEffect(() => {
@@ -193,39 +203,36 @@ export default function VelocePage() {
   }, [status, showTrayIcon]);
 
   // Handle dynamic tray icon updates from VU meter (stable listener — no re-register on level change)
-  useEffect(() => {
-    if (!showTrayIcon || (status !== "listening" && status !== "transcribing")) return;
+  useStableListener<{ rms: number }>(
+    "vu-update",
+    (payload) => {
+      bumpEngineWatchdog();
+      if (!showTrayIcon || (status !== "listening" && status !== "transcribing")) return;
+      const rms = payload.rms;
 
-    let unlisten: () => void;
-    import("@tauri-apps/api/event").then(({ listen }) => {
-      listen<any>("vu-update", (event) => {
-        const rms = event.payload.rms;
+      // Same log scale as mini-vu-bars.tsx
+      let normalized = Math.log10(rms + 1) / 4.2;
+      normalized = (normalized - 0.3) / 0.7;
+      normalized = Math.max(0, Math.min(1, normalized));
 
-        // Same log scale as mini-vu-bars.tsx
-        let normalized = Math.log10(rms + 1) / 4.2;
-        normalized = (normalized - 0.3) / 0.7;
-        normalized = Math.max(0, Math.min(1, normalized));
+      // 5 levels: 0 = minimal bars, 4 = full bars
+      let level = 0;
+      if (normalized > 0.75) level = 4;
+      else if (normalized > 0.5) level = 3;
+      else if (normalized > 0.25) level = 2;
+      else if (normalized > 0.05) level = 1;
 
-        // 5 levels: 0 = minimal bars, 4 = full bars
-        let level = 0;
-        if (normalized > 0.75) level = 4;
-        else if (normalized > 0.5) level = 3;
-        else if (normalized > 0.25) level = 2;
-        else if (normalized > 0.05) level = 1;
-
-        // Only update icon when level actually changes (avoids IPC spam)
-        if (level !== lastTrayLevelRef.current) {
-          lastTrayLevelRef.current = level;
-          const volumes = [0, 100, 500, 1000, 2000];
-          import("@/lib/tauri-client").then(({ safeInvoke }) => {
-            safeInvoke("update_tray_icon", { recording: true, volume: volumes[level] }).catch(console.error);
-          });
-        }
-      }).then(u => { unlisten = u; });
-    });
-
-    return () => { if (unlisten) unlisten(); };
-  }, [showTrayIcon, status]);
+      // Only update icon when level actually changes (avoids IPC spam)
+      if (level !== lastTrayLevelRef.current) {
+        lastTrayLevelRef.current = level;
+        const volumes = [0, 100, 500, 1000, 2000];
+        import("@/lib/tauri-client").then(({ safeInvoke }) => {
+          safeInvoke("update_tray_icon", { recording: true, volume: volumes[level] }).catch(console.error);
+        });
+      }
+    },
+    [showTrayIcon, status, bumpEngineWatchdog]
+  );
 
   // Sync Tray Icon presence with backend
   useEffect(() => {
@@ -569,6 +576,7 @@ export default function VelocePage() {
         });
 
         unlistenStatus = await listen<string>("status-update", (event) => {
+          bumpEngineWatchdog();
           console.log("Status update:", event.payload);
           // Map backend status to UI status
           // Backend: "recording", "stopped", "loading_model", "ready"
@@ -646,6 +654,7 @@ export default function VelocePage() {
 
         // Listen for hardware info
         unlistenHardware = await listen<any>("hardware-info", (event) => {
+          bumpEngineWatchdog();
           console.log("Hardware Info:", event.payload);
           // If we got hardware info, the engine is likely healthy, clear errors
           setEngineError("");
@@ -722,10 +731,9 @@ export default function VelocePage() {
           }
           if (event.payload.gpu) {
             setGpuInfo(event.payload.gpu);
-            // Auto-enable GPU if available
-            if (event.payload.gpu.available) {
-              setGpuEnabled(true);
-            } else if (!whispercppAvailable) {
+            // Do NOT auto-enable GPU from hardware-info; respect the user's saved preference.
+            // Only disable GPU if it is reported unavailable AND whisper.cpp is not available.
+            if (!event.payload.gpu.available && !whispercppAvailable) {
               setGpuEnabled(false);
             }
           }
@@ -758,6 +766,7 @@ export default function VelocePage() {
         });
 
         unlistenTranscription = await listen<{ text?: string; is_final?: boolean; response_ms?: number; recording_id?: number } | string>("transcription-update", (event) => {
+          bumpEngineWatchdog();
           console.log("[FRONTEND] Transcription update:", event.payload); // Debug Log
           const payload = event.payload;
           const text = typeof payload === "string" ? payload : (payload?.text ?? "");
@@ -784,7 +793,10 @@ export default function VelocePage() {
             setLastResponseMs(Math.max(0, Math.round(responseMs)));
           }
           setShowMiniDoneTick(true);
-          window.setTimeout(() => setShowMiniDoneTick(false), 1200);
+          if (doneTickTimerRef.current) {
+            window.clearTimeout(doneTickTimerRef.current);
+          }
+          doneTickTimerRef.current = window.setTimeout(() => setShowMiniDoneTick(false), 1200);
           setEngineError("");
         });
 
@@ -804,6 +816,7 @@ export default function VelocePage() {
         ];
 
         unlistenError = await listen<string>("engine-error", (event) => {
+          bumpEngineWatchdog();
           const message = event.payload ?? "";
 
           if (message.includes("Audio engine executable/script not found")) {
@@ -851,6 +864,7 @@ export default function VelocePage() {
         });
 
         unlistenLog = await listen<string>("engine-log", (event) => {
+          bumpEngineWatchdog();
           const message = event.payload ?? "";
           if (ignoredTechnicalMessages.some(pattern => message.includes(pattern))) {
             return;
@@ -1319,7 +1333,7 @@ export default function VelocePage() {
                   initial={{ opacity: 1 }}
                   exit={{ opacity: 0 }}
                   transition={{ duration: 0.5 }}
-                  className="absolute inset-0 z-50"
+                  className="absolute inset-0 z-40"
                 >
                   <StartupOverlay message={bootMessage ? t(bootMessage) : undefined} />
                 </motion.div>

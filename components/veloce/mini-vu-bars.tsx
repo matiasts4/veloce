@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { useStableListener } from "@/hooks/use-stable-listener";
 
 type Status = "idle" | "listening" | "processing" | "transcribing";
 
@@ -14,6 +15,11 @@ interface VUMeterPayload {
 
 export function MiniVUBars({ status }: MiniVUBarsProps) {
   const barsRef = useRef<(HTMLDivElement | null)[]>([]);
+  const statusRef = useRef(status);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   const getColorClass = () => {
     switch (status) {
@@ -28,64 +34,45 @@ export function MiniVUBars({ status }: MiniVUBarsProps) {
     }
   };
 
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let isSubscribed = true;
+  useStableListener<VUMeterPayload>("vu-update", (payload) => {
+    if (statusRef.current !== "listening") return;
 
-    import("@/lib/tauri-client").then(({ isTauri }) => {
-      if (!isTauri() || !isSubscribed) return;
+    const { rms } = payload;
+    let normalized = Math.log10(rms + 1) / 4.2;
+    normalized = (normalized - 0.3) / 0.7;
 
-      import("@tauri-apps/api/event").then(({ listen }) => {
-        if (!isSubscribed) return;
-        listen<VUMeterPayload>("vu-update", (event) => {
-          if (status !== "listening") return;
-          
-          const { rms } = event.payload;
-          let normalized = Math.log10(rms + 1) / 4.2; 
-          normalized = (normalized - 0.3) / 0.7;
+    if (normalized > 1) normalized = 1;
+    if (normalized < 0) normalized = 0;
 
-          if (normalized > 1) normalized = 1;
-          if (normalized < 0) normalized = 0;
-          
-          // Using minimum 30% height when listening but quiet
-          const minScale = 0.3;
-          
-          barsRef.current.forEach((bar, index) => {
-            if (!bar) return;
-            const distFromCenter = Math.abs(index - 2.5);
-            // Middle bars get full height, outer bars get less
-            const multiplier = 1 - (distFromCenter * 0.15); 
-            
-            // Subtle noise
-            const noise = (Math.random() * 0.1) - 0.05; 
-            
-            let val = normalized * multiplier + (normalized > 0.05 ? noise : 0);
-            val = Math.max(minScale, Math.min(1, val));
-            
-            bar.style.transform = `scaleY(${val})`;
-          });
-        }).then((u) => {
-          unlisten = u;
-        });
-      });
+    // Using minimum 30% height when listening but quiet
+    const minScale = 0.3;
+
+    barsRef.current.forEach((bar, index) => {
+      if (!bar) return;
+      const distFromCenter = Math.abs(index - 2.5);
+      // Middle bars get full height, outer bars get less
+      const multiplier = 1 - (distFromCenter * 0.15);
+
+      // Subtle noise
+      const noise = (Math.random() * 0.1) - 0.05;
+
+      let val = normalized * multiplier + (normalized > 0.05 ? noise : 0);
+      val = Math.max(minScale, Math.min(1, val));
+
+      bar.style.transform = `scaleY(${val})`;
     });
-
-    return () => {
-      isSubscribed = false;
-      if (unlisten) unlisten();
-    };
-  }, [status]);
+  }, []);
 
   // Handle non-listening animations (pulse for transcribing/processing, flat for idle)
   useEffect(() => {
     if (status !== "listening") {
       let animationFrameId: number;
-      
+
       const animate = () => {
         const time = Date.now() / 150; // speed of pulse
         barsRef.current.forEach((bar, index) => {
           if (!bar) return;
-          
+
           if (status === "transcribing" || status === "processing") {
             // Wave pulse effect
             const offset = index * 0.5;
@@ -96,17 +83,13 @@ export function MiniVUBars({ status }: MiniVUBarsProps) {
             bar.style.transform = "scaleY(0.4)";
           }
         });
-        
+
         if (status === "transcribing" || status === "processing") {
           animationFrameId = requestAnimationFrame(animate);
         }
       };
 
-      if (status === "transcribing" || status === "processing") {
-        animate();
-      } else {
-        animate(); // run once to set idle state
-      }
+      animate();
 
       return () => {
         if (animationFrameId) cancelAnimationFrame(animationFrameId);
@@ -118,14 +101,13 @@ export function MiniVUBars({ status }: MiniVUBarsProps) {
 
   return (
     <div className="flex items-center gap-[1.8px] pointer-events-none h-4" data-tauri-drag-region>
-      {[...Array(6)].map((_, i) => (
+      {Array.from({ length: 6 }).map((_, index) => (
         <div
-          key={i}
-          ref={(el) => {
-            barsRef.current[i] = el;
-          }}
-          className={`w-[2.5px] h-full rounded-full transition-colors duration-500 origin-center ${colorClass} ${status === 'listening' ? 'transition-transform duration-[50ms] ease-out' : ''}`}
-          style={{ transform: "scaleY(0.4)" }}
+          key={index}
+          ref={(el) => { barsRef.current[index] = el; }}
+          className={`w-[2.5px] rounded-full transition-transform duration-75 ${colorClass}`}
+          style={{ transform: "scaleY(0.4)", height: "100%" }}
+          data-tauri-drag-region
         />
       ))}
     </div>

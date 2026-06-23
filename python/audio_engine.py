@@ -16,6 +16,8 @@ import io
 import os
 from pathlib import Path
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from logging.handlers import RotatingFileHandler
 
 
 def configure_windows_cuda_dll_paths():
@@ -55,29 +57,66 @@ import atexit
 import signal
 
 # Clean up any orphaned whisper-server processes from previous ungraceful exits
-try:
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "whisper-server.exe"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-        shell=True
-    )
-except Exception:
-    pass
+def _kill_orphaned_whisper_server():
+    """Kill leftover whisper-server processes from previous ungraceful exits."""
+    try:
+        if os.name == 'nt':
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "whisper-server.exe"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                shell=True
+            )
+        else:
+            # Linux/macOS: kill whisper-server and whisper-cli orphans
+            for proc_name in ["whisper-server", "whisper-cli"]:
+                try:
+                    subprocess.run(
+                        ["pkill", "-9", "-f", proc_name],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+_kill_orphaned_whisper_server()
+
+
+def release_gpu_memory():
+    """Release GPU memory held by PyTorch/CTranslate2 after model unload."""
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception as e:
+        logging.debug(f"release_gpu_memory: {e}")
+
 
 # Setup logging
 def setup_logging():
     app_data = get_app_data_dir()
     app_data.mkdir(parents=True, exist_ok=True)
     log_file = app_data / "audio_engine_debug.log"
-    
-    logging.basicConfig(
-        filename=str(log_file),
-        level=logging.DEBUG,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        filemode='w' # Overwrite each run to keep it clean, or 'a' to append
+
+    # Rotating log: 5 MB per file, keep 3 backups so previous sessions survive.
+    handler = RotatingFileHandler(
+        str(log_file),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
     )
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.handlers = []
+    root.addHandler(handler)
+
     logging.info(f"Audio Engine Started. PID: {os.getpid()}")
     return log_file
 
@@ -270,6 +309,12 @@ WHISPERCPP_SERVER_HOST = "127.0.0.1"
 WHISPERCPP_SERVER_PORT = 8178
 WHISPERCPP_SERVER_HEALTH_TIMEOUT = 30.0
 
+# Hard timeouts for transcription inference to prevent the worker from hanging
+# indefinitely when CUDA stalls or the model enters a bad state.
+TRANSCRIBE_TIMEOUT_FINAL = 10.0      # seconds for final segment transcription
+TRANSCRIBE_TIMEOUT_PARTIAL = 5.0     # seconds for live partial transcription
+WHISPERCPP_INFERENCE_TIMEOUT = 8.0   # seconds for whisper.cpp server inference
+
 GRATITUDE_PHRASES = [
     "gracias",
     "muchas gracias",
@@ -333,12 +378,21 @@ EDGE_HALLUCINATION_PHRASES = [
 word_substitutions: dict[str, str] = {}
 recording = False
 current_recording_id = 0
-session_transcript = ""  # Accumulates all final phrases for the active recording session
+session_transcript_pieces: list[str] = []  # Accumulates all final phrases for the active recording session
 stopping = False  # Flag for immediate-stop mode: when True, worker emits "stopped" without draining queue
 debug_callback_count = 0
 debug_process_count = 0
-audio_queue = queue.Queue()
-transcription_queue = queue.Queue() # New queue for async processing
+# Bounded queues prevent unbounded memory growth during long sessions.
+# audio_queue maxsize ~64s of audio at 16kHz with 512-sample chunks.
+audio_queue = queue.Queue(maxsize=2000)
+transcription_queue = queue.Queue(maxsize=50) # New queue for async processing
+
+# Single-worker executor for partial transcriptions to prevent thread explosion.
+partial_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="partial_transcriber")
+
+# Track consecutive whisper-server failures to avoid infinite restart loops.
+whisper_server_failure_count = 0
+WHISPER_SERVER_MAX_FAILURES = 5
 selected_device = None
 selected_model = "large-v3-turbo"
 selected_model_dir = ""
@@ -360,6 +414,14 @@ whisper_server_model_path = ""
 backend_load_lock = threading.Lock()
 pre_roll_chunks = deque(maxlen=max(1, int((RATE * PRE_ROLL_SECONDS) / CHUNK)))
 pre_roll_lock = threading.Lock()
+
+# Worker health monitoring: track the last time the transcription worker
+# successfully finished processing a job. Used to detect stalls caused by
+# hung inference while audio/VU keep flowing.
+worker_health_lock = threading.Lock()
+worker_last_processed_time = 0.0
+worker_stall_reported = False
+audio_last_received_time = 0.0
 
 # Reduce CPU thread pressure to avoid MKL/OMP memory spikes on Windows.
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -843,6 +905,8 @@ def ensure_whisper_server(model_path: str, prefer_gpu: bool) -> tuple[bool, str]
 
             if is_whisper_server_ready():
                 whisper_server_model_path = model_path
+                global whisper_server_failure_count
+                whisper_server_failure_count = 0
                 emit({"log": "whisper-server is ready"})
                 return True, ""
 
@@ -1687,6 +1751,7 @@ def load_whisper(model_name, prefer_gpu):
         if old_model is not None and old_model is not loaded:
             del old_model
             gc.collect()
+            release_gpu_memory()
 
         load_uuid = str(uuid.uuid4())[:6]
         emit({"status": "ready"})
@@ -1748,6 +1813,7 @@ def load_backend(model_name, prefer_gpu, backend_name):
                 emit({"log": "Unloading faster-whisper model from memory"})
                 del previous_model
                 gc.collect()
+                release_gpu_memory()
 
             status = get_whispercpp_status(model_name)
             if not status["available"]:
@@ -1918,21 +1984,29 @@ def start_input_stream(device_id, force_restart=False):
 
     def audio_callback(indata, frames, callback_time, status):
         nonlocal resampler, vu_last_emit
-        global recording
+        global recording, current_stream
         try:
             if status:
-                pass
+                # Log critical PortAudio status flags and force stream restart.
+                status_text = str(status)
+                if "overflow" in status_text.lower() or "underflow" in status_text.lower():
+                    emit({"log": f"PortAudio status: {status_text}"})
+                if "error" in status_text.lower() or "disconnected" in status_text.lower():
+                    emit({"error": f"PortAudio stream error: {status_text}"})
+                    current_stream = None
+                    return
+
             chunk = indata.copy()
-            
+
             # Mix down to mono if needed
             if stream_channels > 1:
                 chunk = np.mean(chunk, axis=1, keepdims=True).astype(np.int16)
-                
+
             # Resample if needed
             if stream_samplerate != RATE:
                 if resampler is None:
                     resampler = torchaudio.transforms.Resample(orig_freq=stream_samplerate, new_freq=RATE)
-                
+
                 # Convert to float32 tensor
                 chunk_tensor = torch.from_numpy(chunk).float().T # [channels, time]
                 chunk_tensor = resampler(chunk_tensor)
@@ -1949,11 +2023,20 @@ def start_input_stream(device_id, force_restart=False):
             with pre_roll_lock:
                 pre_roll_chunks.append(chunk)
             if recording:
-                global debug_callback_count
+                global debug_callback_count, audio_last_received_time
                 debug_callback_count += 1
+                audio_last_received_time = time.time()
                 if debug_callback_count == 1 or debug_callback_count % 50 == 0:
                     emit({"log": f"Audio callback running, chunk len={len(chunk)}, rms={float(np.sqrt(np.mean(chunk.astype(np.float32)**2))):.2f}"})
-                audio_queue.put(chunk)
+                # Bounded queue with back-pressure: drop oldest chunk if full.
+                try:
+                    audio_queue.put_nowait(chunk)
+                except queue.Full:
+                    try:
+                        audio_queue.get_nowait()
+                        audio_queue.put_nowait(chunk)
+                    except queue.Empty:
+                        pass
         except Exception as e:
             emit({"error": f"Audio callback crashed: {e}"})
 
@@ -2194,14 +2277,52 @@ class StreamProcessor:
         # Advance tracking: mark total samples at end of this partial
         self._last_partial_total_samples = current_total
 
-        # Run in thread to not block audio processing loop
-        # We don't put partials in the queue to avoid blocking finals
-        threading.Thread(target=transcribe_segment, args=(delta_audio, False), daemon=True).start()
+        # Run partial in a bounded single-worker executor to avoid unbounded
+        # thread explosion when inference is slower than the partial interval.
+        # Skip this partial if the worker is already saturated.
+        if partial_executor._work_queue.qsize() < 2:
+            partial_executor.submit(transcribe_segment, delta_audio, False)
+        else:
+            emit({"log": "Partial transcription skipped: worker saturated"})
+
+def run_with_timeout(target, args=(), kwargs=None, timeout=10.0, label="operation"):
+    """Run `target(*args, **kwargs)` in a daemon thread with a hard timeout.
+
+    If the thread does not finish within `timeout` seconds, raise a RuntimeError.
+    The thread is left running (we cannot safely kill it), but the caller can
+    discard its result and continue. This prevents a hung CUDA call from freezing
+    the transcription worker indefinitely.
+    """
+    if kwargs is None:
+        kwargs = {}
+
+    result_container = {"value": None, "error": None, "done": False}
+
+    def _wrapper():
+        try:
+            result_container["value"] = target(*args, **kwargs)
+            result_container["done"] = True
+        except Exception as e:
+            result_container["error"] = e
+            result_container["done"] = True
+
+    thread = threading.Thread(target=_wrapper, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if not result_container["done"]:
+        raise RuntimeError(f"{label} timed out after {timeout}s")
+
+    if result_container["error"] is not None:
+        raise result_container["error"]
+
+    return result_container["value"]
+
 
 def transcribe_segment(audio_data, is_final=False, retry_on_cpu=True):
     # This replaces the old transcribe() function logic but adapted
     global current_recording_id, diarization_manager
-    
+
     # Flatten if needed
     if audio_data.ndim > 1:
         audio_data = audio_data.flatten()
@@ -2273,45 +2394,64 @@ def transcribe_segment(audio_data, is_final=False, retry_on_cpu=True):
         # This helps real-time translation for non-English speakers selecting English.
         effective_task = "translate" if selected_language == "en" else "transcribe"
 
+        def _do_transcribe():
+            return model.transcribe(
+                audio_float32,
+                beam_size=1,  # Faster for partials
+                best_of=1,
+                # Disable KV-cache growth that causes unbounded RAM usage in long sessions.
+                # Delta-only partials mean we don't need cross-chunk context anyway.
+                condition_on_previous_text=False,
+                vad_filter=False,  # We already did VAD, don't let whisper's internal VAD filter out partials
+                language=None if selected_language == "auto" else selected_language,
+                task=effective_task,
+            )
+
         start_time = time.time()
-        segments, _ = model.transcribe(
-            audio_float32,
-            beam_size=1, # Faster for partials
-            best_of=1,
-            # Disable KV-cache growth that causes unbounded RAM usage in long sessions.
-            # Delta-only partials mean we don't need cross-chunk context anyway.
-            condition_on_previous_text=False,
-            vad_filter=False, # We already did VAD, don't let whisper's internal VAD filter out partials
-            language=None if selected_language == "auto" else selected_language,
-            task=effective_task
+        timeout_seconds = TRANSCRIBE_TIMEOUT_FINAL if is_final else TRANSCRIBE_TIMEOUT_PARTIAL
+        segments, _ = run_with_timeout(
+            _do_transcribe,
+            timeout=timeout_seconds,
+            label="faster-whisper inference",
         )
-        
+
         text = " ".join([s.text for s in segments]).strip()
         text = cleanup_transcription_text(text, chunk_duration_s)
-        
+
         latency_ms = (time.time() - start_time) * 1000
 
         if text:
-            
             # Build cumulative session text for final segments
             cumulative = text
             if is_final:
-                global session_transcript
-                session_transcript = (session_transcript + " " + text).strip() if session_transcript else text
-                cumulative = session_transcript
+                global session_transcript_pieces
+                session_transcript_pieces.append(text)
+                # Cap cumulative history to avoid unbounded IPC growth on very long sessions.
+                # Keep the most recent pieces while preserving roughly the last ~2 minutes of speech.
+                while len(session_transcript_pieces) > 100:
+                    session_transcript_pieces.pop(0)
+                cumulative = " ".join(session_transcript_pieces)
             else:
                 # For partials, show the committed session so far + this partial
-                cumulative = (session_transcript + " " + text).strip() if session_transcript else text
-            
+                committed = " ".join(session_transcript_pieces)
+                cumulative = (committed + " " + text).strip() if committed else text
+
             emit({
                 "transcription": cumulative,
                 "phrase_text": text,
-                "is_final": is_final, 
+                "is_final": is_final,
                 "recording_id": current_recording_id,
                 "speaker": speaker_label,
-                "response_ms": int(latency_ms)
+                "response_ms": int(latency_ms),
             })
-            
+
+    except RuntimeError as e:
+        if "timed out" in str(e).lower():
+            emit({"error": f"Transcripción demasiado lenta ({'final' if is_final else 'parcial'}). El motor se recuperará automáticamente."})
+            if recording:
+                emit({"status": "listening"})
+        else:
+            emit({"error": f"Transcribe error: {e}"})
     except Exception as e:
         error_text = str(e)
 
@@ -2328,6 +2468,9 @@ def transcribe_segment(audio_data, is_final=False, retry_on_cpu=True):
 
         if retry_on_cpu and active_backend == "faster-whisper" and is_cuda_runtime_error:
             emit({"error": "CUDA runtime error during transcription. large-v3-turbo on GPU is required but CUDA libraries are unavailable."})
+
+            # Release fragmented GPU memory before attempting recovery.
+            release_gpu_memory()
 
             # Retry once with the same requested configuration in case runtime paths were updated.
             reloaded = load_backend(selected_model, gpu_enabled, selected_backend)
@@ -2396,6 +2539,10 @@ def transcription_worker():
             except Exception as e:
                 emit({"error": f"Error processing job: {e}"})
             finally:
+                global worker_last_processed_time, worker_stall_reported
+                with worker_health_lock:
+                    worker_last_processed_time = time.time()
+                    worker_stall_reported = False
                 # Switch back to listening if the session is still active, OR
                 # emit "stopped" once the queue is fully drained.
                 if recording:
@@ -2406,6 +2553,42 @@ def transcription_worker():
             transcription_queue.task_done()
         except Exception as e:
             emit({"error": f"Worker loop error: {e}"})
+
+
+def worker_health_monitor():
+    """Daemon thread that detects when the transcription worker has stalled.
+
+    Audio/VU keep flowing even when inference is hung, so the Rust heartbeat
+    and the frontend watchdog never fire. This monitor watches for the case
+    where audio has arrived recently but the worker has not finished a job
+    in a long time, and emits an error so the UI can recover.
+    """
+    global worker_stall_reported
+    while True:
+        time.sleep(5.0)
+        try:
+            with worker_health_lock:
+                last_processed = worker_last_processed_time
+                already_reported = worker_stall_reported
+
+            if not recording or already_reported:
+                continue
+
+            now = time.time()
+            # Only consider a stall if audio arrived recently (within 3s) and
+            # the worker has not finished anything for 20s. This avoids false
+            # positives during pure silence.
+            audio_recent = (now - audio_last_received_time) < 3.0
+            worker_stalled = (now - last_processed) > 20.0
+
+            if audio_recent and worker_stalled:
+                worker_stall_reported = True
+                emit({"error": "El motor de transcripción no responde. Reiniciando sesión..."})
+                if recording:
+                    emit({"status": "listening"})
+        except Exception as e:
+            emit({"error": f"Worker health monitor error: {e}"})
+
 
 def main():
     emit({"log": "Main function started"})
@@ -2429,6 +2612,10 @@ def main():
     # Transcription worker thread
     emit({"log": "Starting transcription worker thread"})
     threading.Thread(target=transcription_worker, daemon=True).start()
+
+    # Worker health monitor: detects hung inference while audio/VU keep flowing
+    emit({"log": "Starting worker health monitor thread"})
+    threading.Thread(target=worker_health_monitor, daemon=True).start()
 
     # Initialize VAD and StreamProcessor
     emit({"log": "Initializing VAD and StreamProcessor..."})
@@ -2628,15 +2815,27 @@ def transcribe_whispercpp(audio_int16: np.ndarray, language: str, is_final: bool
         audio_bytes = wav_buffer.read()
 
         _, _, inference_url = whisper_server_urls()
-        
+
+        # Runtime health check before spending time on the request.
+        if not is_whisper_server_ready():
+            global whisper_server_failure_count
+            if whisper_server_failure_count < WHISPER_SERVER_MAX_FAILURES:
+                emit({"log": "whisper-server not ready at inference time, attempting restart"})
+                ready, error = ensure_whisper_server(model_path, gpu_enabled)
+                if not ready:
+                    whisper_server_failure_count += 1
+                    return "", f"whisper-server no disponible: {error}"
+            else:
+                return "", "whisper-server failed too many times; giving up"
+
         # Performance trick: disable timestamps on partial generations to get ultra-fast chunk response
         timestamps_flag = "false" if is_final else "true"
-        
+
         fields: dict[str, str] = {
             "response_format": "json",
             "temperature": "0.0",
             "temperature_inc": "0.0",
-            "no_timestamps": timestamps_flag, 
+            "no_timestamps": timestamps_flag,
             "suppress_non_speech": "true",
         }
         if language and language != "auto":
@@ -2644,11 +2843,12 @@ def transcribe_whispercpp(audio_int16: np.ndarray, language: str, is_final: bool
             if language == "en":
                 fields["task"] = "translate"
 
+        # Aggressive timeout so a hung whisper-server does not block the worker for minutes.
         status_code, response_text = http_post_multipart(
             inference_url,
             fields=fields,
             file_field=("file", "chunk.wav", audio_bytes, "audio/wav"),
-            timeout_s=120.0,
+            timeout_s=WHISPERCPP_INFERENCE_TIMEOUT,
         )
 
         if status_code != 200:
@@ -2671,7 +2871,7 @@ def transcribe_whispercpp(audio_int16: np.ndarray, language: str, is_final: bool
 
 
 def command_listener():
-    global recording, selected_device, selected_model, selected_model_dir, selected_language, gpu_enabled, selected_backend, current_recording_id, session_transcript, stopping
+    global recording, selected_device, selected_model, selected_model_dir, selected_language, gpu_enabled, selected_backend, current_recording_id, session_transcript_pieces, stopping
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -2703,7 +2903,7 @@ def command_listener():
                 emit({"error": f"Audio Stream Error: {e}"})
                 continue
             current_recording_id += 1
-            session_transcript = ""  # Reset session buffer on new recording
+            session_transcript_pieces = []  # Reset session buffer on new recording
             stopping = False  # Reset stop flag for new session
             recording = True
             inject_pre_roll_audio()
@@ -2721,6 +2921,9 @@ def command_listener():
         elif line == "EXIT":
             emit({"log": "Received EXIT command. Shutting down."})
             break
+        elif line == "PING":
+            emit({"pong": True})
+            continue
         elif line == "HARDWARE":
             emit(get_hardware_info())
         elif line == "RELOAD_DICT":

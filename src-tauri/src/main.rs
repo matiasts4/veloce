@@ -1,23 +1,33 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri::{AppHandle, Manager, Emitter, Runtime, WindowEvent};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::menu::{Menu, MenuItem};
-use tauri::image::Image;
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tauri::image::Image;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, Runtime, WindowEvent};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
-mod state;
+/// Set to `true` when the binary is invoked with `--start-hidden`.
+/// The Rust `setup` closure reads this to decide whether to call `window.show()`
+/// after the tray is created. Tauri config sets `visible: false` on the main
+/// window, so when this flag is set the window stays hidden until the user
+/// opens it from the tray. When the flag is NOT set we explicitly show the
+/// window (overriding the `visible: false` config) so the normal launch UX
+/// remains unchanged.
+static START_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+mod downloader;
 mod engine;
+mod python_setup;
 mod shortcuts;
 mod startup;
-mod downloader;
-mod python_setup;
+mod state;
 
-use state::{AppState, AutoPasteMode, EngineSettings};
 use shortcuts::HotkeyConfig;
+use state::{AppState, AutoPasteMode, EngineSettings};
 
 fn main() {
     #[cfg(target_os = "linux")]
@@ -25,6 +35,14 @@ fn main() {
         // Enforce X11 backend on Linux to bypass Wayland's strict window management restrictions,
         // which completely block frameless transparent windows from staying always on top.
         std::env::set_var("GDK_BACKEND", "x11");
+    }
+
+    // Parse CLI args early: if the binary was launched with `--start-hidden`
+    // (e.g. from the user's autostart entry) keep the main window hidden and
+    // rely on the tray to show it later. Otherwise the window pops up at boot,
+    // which the user does not want on auto-start.
+    if std::env::args().any(|a| a == "--start-hidden") {
+        START_HIDDEN.store(true, Ordering::SeqCst);
     }
 
     tauri::Builder::default()
@@ -43,11 +61,11 @@ fn main() {
         .setup(|app| {
             let app_handle = app.handle();
             // Store child in state
-            let child_arc = Arc::new(Mutex::new(None));
+            let child_arc = Arc::new(tokio::sync::Mutex::new(None));
             let clipboard_mode = Arc::new(Mutex::new(false));
             let clipboard_auto_paste = Arc::new(Mutex::new(false));
             let auto_paste_mode = Arc::new(Mutex::new(AutoPasteMode::default_for_current_os()));
-            
+
             app.manage(AppState {
                 sidecar_child: child_arc.clone(),
                 recording: Arc::new(Mutex::new(false)),
@@ -70,6 +88,18 @@ fn main() {
             // This ensures only ONE tray icon ever exists — frontend controls visibility via set_tray_visible
             let _ = create_tray(app_handle);
 
+            // Honor the `--start-hidden` CLI flag: tauri.conf.json sets
+            // `visible: false` on the main window so we can boot silently
+            // (tray-only). For the normal (non-autostart) launch we explicitly
+            // call `show()` here so the user still sees the window. The tray
+            // "show" / left-click handlers already use `unminimize() + show()`
+            // so they keep working regardless of this flag.
+            if !START_HIDDEN.load(Ordering::SeqCst) {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                }
+            }
+
             let app_handle_clone = app_handle.clone();
             let child_arc_clone = child_arc.clone();
             tauri::async_runtime::spawn(async move {
@@ -77,7 +107,7 @@ fn main() {
                     println!("[RUST] Startup spawn failed: {}", error);
                     println!("[RUST] Attempting auto-recovery/setup...");
                     let _ = app_handle_clone.emit("status-update", "Iniciando configuración automática...");
-                    
+
                     match engine::install_engine(&app_handle_clone).await {
                         Ok(_) => {
                             println!("[RUST] Setup complete. Retrying spawn...");
@@ -113,7 +143,7 @@ fn main() {
                     }
                 }
             });
-            
+
             // Register Shortcuts
             let shortcut_focus = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyV);
 
@@ -213,8 +243,8 @@ fn create_tray(app: &AppHandle) -> Result<(), tauri::Error> {
 
     // Use our custom bars icon as the tray icon — never use the square W logo
     let bars_idle = include_bytes!("../icons/32x32.png");
-    let icon = Image::from_bytes(bars_idle)
-        .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
+    let icon =
+        Image::from_bytes(bars_idle).unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
 
     TrayIconBuilder::with_id("main")
         .icon(icon)
@@ -233,9 +263,12 @@ fn create_tray(app: &AppHandle) -> Result<(), tauri::Error> {
                 "quit" => {
                     // Stop the audio engine (sends EXIT + waits + kills process tree)
                     // before exiting so the Python process is not left as an orphan.
-                    let state = app.state::<AppState>();
-                    engine::stop_audio_engine(&state);
-                    app.exit(0);
+                    let child_arc = app.state::<AppState>().sidecar_child.clone();
+                    let app_clone = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        engine::stop_audio_engine_arc(child_arc).await;
+                        app_clone.exit(0);
+                    });
                 }
                 _ => {}
             }
@@ -264,7 +297,6 @@ fn create_tray(app: &AppHandle) -> Result<(), tauri::Error> {
         .build(app)?;
     Ok(())
 }
-
 
 #[tauri::command]
 async fn install_audio_engine(app: AppHandle) -> Result<(), String> {
@@ -366,7 +398,10 @@ fn press_paste_shortcut_for_mode(mode: AutoPasteMode) -> Result<(), String> {
 
 #[tauri::command]
 #[allow(non_snake_case)]
-fn press_paste_shortcut(state: tauri::State<AppState>, autoPasteMode: Option<String>) -> Result<(), String> {
+fn press_paste_shortcut(
+    state: tauri::State<AppState>,
+    autoPasteMode: Option<String>,
+) -> Result<(), String> {
     let mode = autoPasteMode
         .as_deref()
         .map(AutoPasteMode::from_value)
@@ -375,48 +410,72 @@ fn press_paste_shortcut(state: tauri::State<AppState>, autoPasteMode: Option<Str
 }
 
 #[tauri::command]
-async fn toggle_recording<R: Runtime>(app: AppHandle<R>, state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    if state.sidecar_child.lock().map_err(|e| e.to_string())?.is_none() {
-        if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await {
-            let _ = app.emit("engine-error", error);
-            return Ok(false);
+async fn toggle_recording<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    {
+        let lock = state.sidecar_child.lock().await;
+        if lock.is_none() {
+            drop(lock);
+            if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await
+            {
+                let _ = app.emit("engine-error", error);
+                return Ok(false);
+            }
         }
     }
 
-    let mut recording = state.recording.lock().map_err(|e| e.to_string())?;
-    *recording = !*recording;
+    let new_recording = {
+        let mut recording = state.recording.lock().map_err(|e| e.to_string())?;
+        *recording = !*recording;
+        *recording
+    };
 
-    let cmd = if *recording { "START\n" } else { "STOP\n" };
-    if let Err(error) = engine::write_engine_command(&state, cmd) {
+    let cmd = if new_recording { "START\n" } else { "STOP\n" };
+    if let Err(error) = engine::write_engine_command(&state, cmd).await {
+        let mut recording = state.recording.lock().map_err(|e| e.to_string())?;
         *recording = false;
         let _ = app.emit("recording-state", false);
-        let _ = app.emit("engine-error", format!("No se pudo enviar comando al motor: {error}"));
+        let _ = app.emit(
+            "engine-error",
+            format!("No se pudo enviar comando al motor: {error}"),
+        );
         return Ok(false);
     }
 
-    app.emit("recording-state", *recording).map_err(|e| e.to_string())?;
-    Ok(*recording)
+    app.emit("recording-state", new_recording)
+        .map_err(|e| e.to_string())?;
+    Ok(new_recording)
 }
 
 #[tauri::command]
 fn set_capture_mode(state: tauri::State<AppState>, mode: String) -> Result<(), String> {
     let normalized = mode.trim().to_lowercase();
-    let effective = if normalized == "hold" { "hold" } else { "toggle" };
+    let effective = if normalized == "hold" {
+        "hold"
+    } else {
+        "toggle"
+    };
     let mut lock = state.capture_mode.lock().map_err(|e| e.to_string())?;
     *lock = effective.to_string();
     Ok(())
 }
 
 #[tauri::command]
-fn set_capture_hotkey(app: AppHandle, state: tauri::State<AppState>, hotkey: HotkeyConfig) -> Result<(), String> {
+fn set_capture_hotkey(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    hotkey: HotkeyConfig,
+) -> Result<(), String> {
     shortcuts::register_capture_shortcut(&app, &state, hotkey)
 }
 
 #[tauri::command]
 #[allow(non_snake_case)]
-fn set_engine_settings(
+async fn set_engine_settings(
     app: AppHandle,
-    state: tauri::State<AppState>,
+    state: tauri::State<'_, AppState>,
     microphone: String,
     model: String,
     modelDir: String,
@@ -444,8 +503,11 @@ fn set_engine_settings(
     });
 
     let cmd = format!("CONFIG {}\n", payload);
-    if let Err(error) = engine::write_engine_command(&state, &cmd) {
-        let _ = app.emit("engine-error", format!("No se pudo actualizar configuración del motor: {error}"));
+    if let Err(error) = engine::write_engine_command(&state, &cmd).await {
+        let _ = app.emit(
+            "engine-error",
+            format!("No se pudo actualizar configuración del motor: {error}"),
+        );
     }
 
     Ok(())
@@ -453,15 +515,23 @@ fn set_engine_settings(
 
 #[tauri::command]
 async fn refresh_hardware(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if state.sidecar_child.lock().map_err(|e| e.to_string())?.is_none() {
-        if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await {
-            let _ = app.emit("engine-error", error);
-            return Ok(());
+    {
+        let lock = state.sidecar_child.lock().await;
+        if lock.is_none() {
+            drop(lock);
+            if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await
+            {
+                let _ = app.emit("engine-error", error);
+                return Ok(());
+            }
         }
     }
 
-    if let Err(error) = engine::write_engine_command(&state, "HARDWARE\n") {
-        let _ = app.emit("engine-error", format!("No se pudo consultar hardware: {error}"));
+    if let Err(error) = engine::write_engine_command(&state, "HARDWARE\n").await {
+        let _ = app.emit(
+            "engine-error",
+            format!("No se pudo consultar hardware: {error}"),
+        );
     }
     Ok(())
 }
@@ -477,9 +547,9 @@ fn set_startup_enabled(enabled: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn reload_word_dictionary(state: tauri::State<AppState>) -> Result<(), String> {
+async fn reload_word_dictionary(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let cmd = "RELOAD_DICT\n";
-    if let Err(error) = engine::write_engine_command(&state, cmd) {
+    if let Err(error) = engine::write_engine_command(&state, cmd).await {
         return Err(format!("No se pudo enviar comando al motor: {}", error));
     }
     Ok(())
@@ -493,7 +563,10 @@ fn get_dictionary_path() -> PathBuf {
 }
 
 #[tauri::command]
-fn write_word_dictionary(state: tauri::State<AppState>, json: String) -> Result<(), String> {
+async fn write_word_dictionary(
+    state: tauri::State<'_, AppState>,
+    json: String,
+) -> Result<(), String> {
     use std::fs;
     let final_path = get_dictionary_path();
     let parent = final_path
@@ -503,20 +576,30 @@ fn write_word_dictionary(state: tauri::State<AppState>, json: String) -> Result<
     fs::create_dir_all(parent).map_err(|e| format!("create_dir_all failed: {e}"))?;
     fs::write(&tmp_path, json.as_bytes()).map_err(|e| format!("write tmp failed: {e}"))?;
     fs::rename(&tmp_path, &final_path).map_err(|e| format!("rename failed: {e}"))?;
-    engine::write_engine_command(&state, "RELOAD_DICT\n")
+    engine::write_engine_command(&state, "RELOAD_DICT\n").await
 }
 
 #[tauri::command]
-async fn download_model(app: AppHandle, state: tauri::State<'_, AppState>, model: String, download_dir: Option<String>) -> Result<(), String> {
+async fn download_model(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    model: String,
+    download_dir: Option<String>,
+) -> Result<(), String> {
     let model = model.trim().to_string();
     if model.is_empty() {
         return Err("Model name is required".to_string());
     }
 
-    if state.sidecar_child.lock().map_err(|e| e.to_string())?.is_none() {
-        if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await {
-            let _ = app.emit("engine-error", error.clone());
-            return Err(error);
+    {
+        let lock = state.sidecar_child.lock().await;
+        if lock.is_none() {
+            drop(lock);
+            if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await
+            {
+                let _ = app.emit("engine-error", error.clone());
+                return Err(error);
+            }
         }
     }
 
@@ -524,29 +607,42 @@ async fn download_model(app: AppHandle, state: tauri::State<'_, AppState>, model
         "model": model,
         "dir": download_dir
     });
-    
+
     let cmd = format!("DOWNLOAD {}\n", payload.to_string());
-    if let Err(error) = engine::write_engine_command(&state, &cmd) {
+    if let Err(error) = engine::write_engine_command(&state, &cmd).await {
         let message = format!("No se pudo descargar el modelo {model}: {error}");
         let _ = app.emit("engine-error", message.clone());
         return Err(message);
     } else {
-        let _ = app.emit("engine-log", format!("Iniciando descarga de modelo: {model}"));
+        let _ = app.emit(
+            "engine-log",
+            format!("Iniciando descarga de modelo: {model}"),
+        );
     }
     Ok(())
 }
 
 #[tauri::command]
-async fn delete_model(app: AppHandle, state: tauri::State<'_, AppState>, model: String, path: Option<String>) -> Result<(), String> {
+async fn delete_model(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    model: String,
+    path: Option<String>,
+) -> Result<(), String> {
     let model = model.trim().to_string();
     if model.is_empty() {
         return Err("Model name is required".to_string());
     }
 
-    if state.sidecar_child.lock().map_err(|e| e.to_string())?.is_none() {
-        if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await {
-            let _ = app.emit("engine-error", error.clone());
-            return Err(error);
+    {
+        let lock = state.sidecar_child.lock().await;
+        if lock.is_none() {
+            drop(lock);
+            if let Err(error) = engine::spawn_audio_engine(&app, state.sidecar_child.clone()).await
+            {
+                let _ = app.emit("engine-error", error.clone());
+                return Err(error);
+            }
         }
     }
 
@@ -554,14 +650,17 @@ async fn delete_model(app: AppHandle, state: tauri::State<'_, AppState>, model: 
         "model": model,
         "path": path
     });
-    
+
     let cmd = format!("DELETE_MODEL {}\n", payload.to_string());
-    if let Err(error) = engine::write_engine_command(&state, &cmd) {
+    if let Err(error) = engine::write_engine_command(&state, &cmd).await {
         let message = format!("No se pudo eliminar el modelo {model}: {error}");
         let _ = app.emit("engine-error", message.clone());
         return Err(message);
     } else {
-        let _ = app.emit("engine-log", format!("Solicitando eliminación de modelo: {model}"));
+        let _ = app.emit(
+            "engine-log",
+            format!("Solicitando eliminación de modelo: {model}"),
+        );
     }
     Ok(())
 }
@@ -574,13 +673,22 @@ mod tests {
     #[test]
     fn parses_known_auto_paste_modes() {
         assert_eq!(AutoPasteMode::from_value("ctrl_v"), AutoPasteMode::CtrlV);
-        assert_eq!(AutoPasteMode::from_value("ctrl_shift_v"), AutoPasteMode::CtrlShiftV);
-        assert_eq!(AutoPasteMode::from_value("type_text"), AutoPasteMode::TypeText);
+        assert_eq!(
+            AutoPasteMode::from_value("ctrl_shift_v"),
+            AutoPasteMode::CtrlShiftV
+        );
+        assert_eq!(
+            AutoPasteMode::from_value("type_text"),
+            AutoPasteMode::TypeText
+        );
     }
 
     #[test]
     fn defaults_to_ctrl_v_when_mode_is_unknown() {
-        assert_eq!(AutoPasteMode::from_value("something-else"), AutoPasteMode::CtrlV);
+        assert_eq!(
+            AutoPasteMode::from_value("something-else"),
+            AutoPasteMode::CtrlV
+        );
     }
 
     #[test]
